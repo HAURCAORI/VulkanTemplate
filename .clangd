@@ -1,0 +1,6 @@
+CompileFlags:
+  Add:
+    - "-std=c++20"
+    - "-DVK_NO_PROTOTYPES"
+    - "-DIMGUI_IMPL_VULKAN_USE_VOLK"
+  CompilationDatabase: build

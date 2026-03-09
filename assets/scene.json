@@ -1,0 +1,38 @@
+// Example scene file for VulkanTemplate.
+// Set Config::sceneFile = "assets/scene.json" (or point to a copy) to use it.
+// Meshes, textures, and objects missing from this file are simply skipped.
+// The "default" texture (1x1 white) is always pre-registered by the engine.
+{
+    "meshes": [
+        {"name": "ground", "type": "quad"},
+        {"name": "sphere", "type": "sphere", "rings": 32, "sectors": 64},
+        {"name": "cube",   "type": "cube"}
+    ],
+
+    // Add file-based textures here, e.g.:
+    // {"name": "stone", "path": "assets/textures/stone.png"}
+    "textures": [],
+
+    "objects": [
+        {
+            "mesh":     "ground",
+            "texture":  "default",
+            "rotation": [-90, 0, 0],
+            "scale":    [8, 8, 1]
+        },
+        {
+            "mesh":        "sphere",
+            "texture":     "default",
+            "position":    [0, 0.5, 0],
+            "rigidBody":   true,
+            "boundRadius": 0.5
+        },
+        {
+            "mesh":        "cube",
+            "texture":     "default",
+            "position":    [2.5, 0.5, 0],
+            "rigidBody":   true,
+            "boundRadius": 0.87
+        }
+    ]
+}

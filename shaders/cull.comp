@@ -1,0 +1,110 @@
+#version 450
+
+// GPU compute frustum culling pass.
+//
+// One invocation per scene object. Each invocation:
+//   1. Tests the object's world-space bounding sphere against the 6 frustum planes.
+//   2. If visible: atomicAdd to cmds[batchId].instanceCount to claim a slot.
+//   3. Writes InstanceData to instances[firstInstance + slot].
+//
+// If the bounding sphere radius is 0 the object is never culled (always visible).
+//
+// Push constants and all SSBO structs must stay in sync with their C++ counterparts
+// in src/render/CullPass.cpp and src/scene/CullObject.h.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// -- Per-object input (CPU-written each frame, std430) ------------------------
+// Must match CullObject in src/scene/CullObject.h (160 bytes).
+struct CullObject {
+    mat4  model;           // 64B: floating-origin camera-relative transform
+    mat4  normalMatrix;    // 64B: corrects normals under non-uniform scale
+    vec4  boundingSphere;  // 16B: xyz=world center, w=radius (0 = no cull)
+    uint  batchId;         //  4B: index into cmds[]
+    uint  materialId;      //  4B: index into GPUMaterial SSBO
+    uint  firstInstance;   //  4B: base offset in instances[] for this batch
+    uint  maxInstances;    //  4B: capacity guard (total objects in this batch)
+}; // 160B
+
+layout(set = 0, binding = 0, std430) readonly buffer CullObjectSSBO {
+    CullObject objects[];
+};
+
+// -- InstanceData output (GPU-written, read by vertex shader, std430) ---------
+// Must match InstanceData in src/scene/InstanceData.h (144 bytes).
+struct InstanceData {
+    mat4 model;        // 64B
+    mat4 normalMatrix; // 64B
+    uint materialId;   //  4B
+    uint _pad0;        //  4B
+    uint _pad1;        //  4B
+    uint _pad2;        //  4B
+}; // 144B
+
+layout(set = 0, binding = 1, std430) writeonly buffer InstanceSSBO {
+    InstanceData instances[];
+};
+
+// -- Indirect draw commands (GPU atomicAdd on instanceCount) ------------------
+// Matches VkDrawIndexedIndirectCommand (20 bytes).
+struct DrawCmd {
+    uint indexCount;
+    uint instanceCount;  // GPU increments this via atomicAdd
+    uint firstIndex;
+    int  vertexOffset;
+    uint firstInstance;
+};
+
+layout(set = 0, binding = 2, std430) buffer DrawCmdSSBO {
+    DrawCmd cmds[];
+};
+
+// -- Push constants (112 bytes) -----------------------------------------------
+// Must match CullPushConstants in src/render/CullPass.cpp.
+layout(push_constant) uniform CullPush {
+    vec4 planes[6];    // 96B: world-space frustum planes (normal xyz, distance w)
+    uint objectCount;  //  4B: number of valid CullObject entries
+    uint _pad[3];      // 12B: alignment
+} push;
+
+// -- Frustum test (world-space bounding sphere) --------------------------------
+// Returns true if the sphere (center, radius) intersects or is inside the frustum.
+// A point is inside a half-space when: dot(plane.xyz, p) + plane.w >= 0.
+// The sphere is outside the frustum when any plane distance < -radius.
+bool frustumTest(vec3 center, float radius) {
+    for (int i = 0; i < 6; ++i) {
+        if (dot(push.planes[i].xyz, center) + push.planes[i].w < -radius)
+            return false;
+    }
+    return true;
+}
+
+// =============================================================================
+void main() {
+    const uint gid = gl_GlobalInvocationID.x;
+    if (gid >= push.objectCount) return;
+
+    CullObject obj = objects[gid];
+
+    // Frustum test: radius 0 means no bounding volume -- always draw.
+    if (obj.boundingSphere.w > 0.0
+        && !frustumTest(obj.boundingSphere.xyz, obj.boundingSphere.w))
+        return; // culled
+
+    const uint batchId = obj.batchId;
+
+    // Claim an instance slot within this batch's region.
+    // atomicAdd returns the previous value (the local index for this invocation).
+    const uint localIdx = atomicAdd(cmds[batchId].instanceCount, 1u);
+    if (localIdx >= obj.maxInstances) return; // overflow guard
+
+    // Write InstanceData to the correct slot in the instance SSBO.
+    InstanceData inst;
+    inst.model        = obj.model;
+    inst.normalMatrix = obj.normalMatrix;
+    inst.materialId   = obj.materialId;
+    inst._pad0        = 0u;
+    inst._pad1        = 0u;
+    inst._pad2        = 0u;
+    instances[obj.firstInstance + localIdx] = inst;
+}
