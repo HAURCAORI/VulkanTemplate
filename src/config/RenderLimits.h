@@ -19,6 +19,9 @@ struct RenderLimits {
     // A batch is a unique (mesh, textureSet) pair in the scene.
     // Each entry is 20 bytes (VkDrawIndexedIndirectCommand).
     static constexpr uint32_t kMaxBatches        = 1024;
+    // Maximum entries in the bindless sampler2D[] array (Track G).
+    // Each entry is one VkDescriptorImageInfo slot in the UPDATE_AFTER_BIND pool.
+    static constexpr uint32_t kMaxBindlessTextures = 1024;
     // Compute workgroup size for cull.comp (local_size_x).
     // Must match the layout qualifier in shaders/cull.comp.
     static constexpr uint32_t kCullWorkgroupSize = 64;

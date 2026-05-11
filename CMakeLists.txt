@@ -156,23 +156,37 @@ if(VKT_BUILD_TESTS)
 
     # Only compile CPU-logic sources. Excluded intentionally:
     #   Application.cpp  -- defines main(), pulls in full Vulkan init
-    #   Allocator.cpp    -- defines VMA_IMPLEMENTATION (must be in exactly one TU)
+    #   Allocator.cpp    -- defines VMA_IMPLEMENTATION; replaced by tests/vma_impl.cpp below
     #   Texture.cpp      -- defines STB_IMAGE_IMPLEMENTATION
     #   ImGuiLayer.cpp   -- requires a live GLFW/Vulkan context
     #   SceneLoader.cpp  -- exercises upload path; tested via RenderWorld directly
+    #
+    # Track D sources added:
+    #   D1: UpdateLoop.cpp -- threaded/non-threaded concurrency tests
+    #   D2: ShadowPass.cpp + PipelineBuilder.cpp + Shader.cpp -- cascade math tests
+    #       (updateCascades is pure GLM; no Vulkan calls are made in test builds)
+    #   D3: RenderWorld.cpp already present -- buildCullData limit / overflow tests
     add_executable(vkt_tests
         tests/main.cpp
+        tests/vma_impl.cpp          # VMA_IMPLEMENTATION -- one TU, mirrors Allocator.cpp
         tests/test_renderworld.cpp
         tests/test_camera.cpp
         tests/test_frustum.cpp
         tests/test_units.cpp
+        tests/test_updateloop.cpp
+        tests/test_shadow_cascade.cpp
+        tests/test_culling.cpp
         src/scene/Camera.cpp
         src/scene/RenderWorld.cpp
         src/scene/Frustum.cpp
         src/scene/Mesh.cpp
         src/scene/InstanceBuffer.cpp
+        src/scene/UpdateLoop.cpp
         src/resources/Buffer.cpp
         src/resources/Image.cpp
+        src/render/ShadowPass.cpp
+        src/pipeline/PipelineBuilder.cpp
+        src/pipeline/Shader.cpp
     )
 
     target_include_directories(vkt_tests PRIVATE src ${stb_SOURCE_DIR})
@@ -188,7 +202,7 @@ if(VKT_BUILD_TESTS)
         GLM_FORCE_DEPTH_ZERO_TO_ONE
     )
     if(MSVC)
-        target_compile_options(vkt_tests PRIVATE /W4 /WX- /utf-8)
+        target_compile_options(vkt_tests PRIVATE /W4 /WX- /utf-8 /FS)
     else()
         target_compile_options(vkt_tests PRIVATE -Wall -Wextra)
     endif()

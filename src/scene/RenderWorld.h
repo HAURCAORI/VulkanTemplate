@@ -213,9 +213,12 @@ public:
     // COMPUTE_WRITE -> VERTEX_SHADER + DRAW_INDIRECT barrier between them).
     // indirectBuffer must contain valid VkDrawIndexedIndirectCommand data indexed
     // by CullBatch::batchId (filled by compute shader + CPU for static fields).
+    // skipTextureBinds: when true (bindless path), per-batch set=1 binds are skipped;
+    //   the caller must have already bound the bindless descriptor set to set=1.
     void drawIndirect(VkCommandBuffer cmd, VkPipelineLayout layout,
                       const std::vector<CullBatch>& batches,
-                      VkBuffer indirectBuffer) const;
+                      VkBuffer indirectBuffer,
+                      bool skipTextureBinds = false) const;
 
     // Compatibility wrapper: builds batches then calls draw().
     // Call inside an active render pass with the pipeline already bound.

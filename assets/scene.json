@@ -13,6 +13,12 @@
     // {"name": "stone", "path": "assets/textures/stone.png"}
     "textures": [],
 
+    // Optional named materials. Objects can reference them via "material".
+    // Example:
+    // {"name": "blue_pbr", "baseColor": [0.2, 0.6, 1.0, 1.0],
+    //  "roughness": 0.3, "metallic": 0.8, "usePBR": true}
+    "materials": [],
+
     "objects": [
         {
             "mesh":     "ground",

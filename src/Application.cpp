@@ -27,6 +27,30 @@ namespace fs = std::filesystem;
 
 namespace {
 constexpr glm::vec3 kShadowLightDirFallback{-0.5f, -1.0f, -0.5f};
+
+uint16_t floatToHalfBits(float v) {
+    uint32_t f = 0;
+    std::memcpy(&f, &v, sizeof(f));
+    const uint32_t sign = (f >> 31u) & 0x1u;
+    const uint32_t exp  = (f >> 23u) & 0xFFu;
+    uint32_t mant       =  f         & 0x7FFFFFu;
+
+    if (exp == 255u)
+        return static_cast<uint16_t>((sign << 15u) | 0x7C00u | (mant ? 0x200u : 0u));
+    if (exp == 0u)
+        return static_cast<uint16_t>(sign << 15u);
+
+    const int e = static_cast<int>(exp) - 127 + 15;
+    if (e >= 31)
+        return static_cast<uint16_t>((sign << 15u) | 0x7C00u);
+    if (e <= 0) {
+        if (e < -10)
+            return static_cast<uint16_t>(sign << 15u);
+        mant = (mant | 0x800000u) >> static_cast<uint32_t>(1 - e);
+        return static_cast<uint16_t>((sign << 15u) | (mant >> 13u));
+    }
+    return static_cast<uint16_t>((sign << 15u) | (static_cast<uint32_t>(e) << 10u) | (mant >> 13u));
+}
 } // namespace
 
 // -- Lifecycle ------------------------------------------------------------------
@@ -40,7 +64,9 @@ void Application::init(const Config& cfg) {
     initVulkan(cfg);
     createFrameData();
     createRenderFinishedSemaphores();
+    createGpuTimestamps();
     createDescriptors();
+    createBindlessResources();
     createPipelineCache();
     // PostProcess creates the HDR render pass before createPipeline() needs it.
     createPostProcess(cfg);
@@ -64,7 +90,22 @@ void Application::init(const Config& cfg) {
     // CullPass init: needs instance buffer handles (created in createDescriptors)
     // and the compiled cull.comp SPIR-V.
     createCullPass();
+    // Sky background pass: draws before geometry inside the HDR render pass.
+    // Must be initialized before createIblResources() so that setCubemap()
+    // finds m_skyPass already initialized and can update its descriptor.
+    createSkyPass(cfg);
+    // IBL placeholder textures: writes bindings 4, 5, 6 into global sets.
+    // If iblPath is set, bakes the env cubemap and calls m_skyPass.setCubemap().
+    createIblResources();
     loadScene();
+    // Render graph: built after all passes and the scene are initialized so that
+    // execute lambdas can reference fully constructed members.
+    createRenderGraph();
+    // Async streaming: init after m_defaultImage/Sampler (placeholders) exist.
+    createStreamLoader();
+    // Shader hot-reload watcher (Track F): start last so the exe dir and
+    // output dir are fully established.  Non-fatal if source dir not found.
+    createShaderWatcher();
     m_running = true;
 }
 
@@ -120,6 +161,13 @@ void Application::initVulkan(const Config& cfg) {
     // Clamp MSAA to what the physical device actually supports
     VkPhysicalDeviceProperties devProps{};
     vkGetPhysicalDeviceProperties(m_ctx.physicalDevice(), &devProps);
+    // Save for E1 GPU timestamp conversion: nanoseconds per GPU tick.
+    m_timestampPeriod = devProps.limits.timestampPeriod;
+
+    // H1: query heap count once for the Memory Budget Dashboard.
+    VkPhysicalDeviceMemoryProperties memProps{};
+    vkGetPhysicalDeviceMemoryProperties(m_ctx.physicalDevice(), &memProps);
+    m_heapCount = memProps.memoryHeapCount;
     VkSampleCountFlags supported = devProps.limits.framebufferColorSampleCounts
                                  & devProps.limits.framebufferDepthSampleCounts;
     VkSampleCountFlagBits msaa = VK_SAMPLE_COUNT_1_BIT;
@@ -193,6 +241,40 @@ void Application::createFrameData() {
     }
 }
 
+void Application::createGpuTimestamps() {
+    // Init GPU timestamp query pools for E1 per-pass timing.
+    // Failure is non-fatal: GpuTimestamps degrades gracefully when unsupported.
+    m_gpuTimestamps.init(m_ctx.device(), m_ctx.physicalDevice(),
+                         m_ctx.graphicsQueueIndex(), MAX_FRAMES_IN_FLIGHT);
+}
+
+void Application::createBindlessResources() {
+    // G1: Detect descriptor indexing support (core in Vulkan 1.2).
+    VkPhysicalDeviceDescriptorIndexingFeatures indexing{};
+    indexing.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
+    VkPhysicalDeviceFeatures2 feat2{};
+    feat2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    feat2.pNext = &indexing;
+    vkGetPhysicalDeviceFeatures2(m_ctx.physicalDevice(), &feat2);
+
+    m_bindlessSupported =
+        indexing.descriptorBindingPartiallyBound       &&
+        indexing.runtimeDescriptorArray                &&
+        indexing.shaderSampledImageArrayNonUniformIndexing &&
+        indexing.descriptorBindingVariableDescriptorCount;
+
+    std::printf("[App] Bindless textures: %s\n",
+                m_bindlessSupported ? "supported" : "not supported (per-bind fallback)");
+
+    if (!m_bindlessSupported) {
+        m_useBindless = false;
+        return;
+    }
+
+    m_bindlessSet.init(m_ctx.device(), RenderLimits::kMaxBindlessTextures);
+    m_useBindless = true;
+}
+
 void Application::createRenderFinishedSemaphores() {
     const uint32_t count = m_swapchain.imageCount();
     m_renderFinishedSemaphores.resize(count, VK_NULL_HANDLE);
@@ -217,7 +299,8 @@ void Application::destroyRenderFinishedSemaphores() {
 
 void Application::createDescriptors() {
     // Set 0: global UBO (binding 0) + instance SSBO (binding 1) + shadow map (binding 2)
-    //        + material SSBO (binding 3) -- one per frame in flight.
+    //        + material SSBO (binding 3) + IBL irradiance (4) + IBL prefilter (5) + IBL LUT (6)
+    //        -- one per frame in flight.
     m_globalLayout = DescriptorLayoutBuilder{}
         .addBinding(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
                     VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
@@ -228,21 +311,30 @@ void Application::createDescriptors() {
                     RenderLimits::kMaxShadowCascades)
         .addBinding(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_SHADER_STAGE_FRAGMENT_BIT)
+        .addBinding(4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    VK_SHADER_STAGE_FRAGMENT_BIT)  // IBL irradiance cubemap
+        .addBinding(5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    VK_SHADER_STAGE_FRAGMENT_BIT)  // IBL prefiltered env cubemap
+        .addBinding(6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    VK_SHADER_STAGE_FRAGMENT_BIT)  // IBL BRDF LUT
         .build(m_ctx.device());
 
-    // Set 1: per-material texture
+    // Set 1: per-material albedo (binding 0) + normal map (binding 1).
     m_materialLayout = DescriptorLayoutBuilder{}
         .addBinding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    VK_SHADER_STAGE_FRAGMENT_BIT)
+        .addBinding(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     VK_SHADER_STAGE_FRAGMENT_BIT)
         .build(m_ctx.device());
 
     // Pool capacity is runtime-configurable for scene scalability.
-    // Extra COMBINED_IMAGE_SAMPLER ratio: global sets (binding=2, shadow map) + per-material sets.
+    // IBL adds 3 more samplers per global set (bindings 4,5,6); normal map adds 1 per material set.
+    // Raise COMBINED_IMAGE_SAMPLER ratio from 6 to 9 to accommodate IBL bindings.
     const uint32_t maxSets = std::max(64u, m_cfg.maxDescriptorSets);
     m_descriptorPool.init(m_ctx.device(), maxSets, {
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         1.0f},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         1.0f},
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6.0f},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 9.0f},
     });
 
     // Note: m_defaultMaterialSet is allocated in loadScene() after the image is created.
@@ -349,6 +441,394 @@ void Application::createCullPass() {
             m_instanceBuffers[i].handle(), instSize,
             m_indirectBuffers[i].handle(), indrSize);
     }
+}
+
+VkCommandBuffer Application::beginImmediateCommands(VkCommandPool& pool) const {
+    VkCommandPoolCreateInfo poolInfo{};
+    poolInfo.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    poolInfo.queueFamilyIndex = m_ctx.graphicsQueueIndex();
+    poolInfo.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    if (vkCreateCommandPool(m_ctx.device(), &poolInfo, nullptr, &pool) != VK_SUCCESS)
+        throw std::runtime_error("[App] Failed to create transient command pool");
+
+    VkCommandBufferAllocateInfo cbInfo{};
+    cbInfo.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cbInfo.commandPool        = pool;
+    cbInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbInfo.commandBufferCount = 1;
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(m_ctx.device(), &cbInfo, &cmd) != VK_SUCCESS) {
+        vkDestroyCommandPool(m_ctx.device(), pool, nullptr);
+        pool = VK_NULL_HANDLE;
+        throw std::runtime_error("[App] Failed to allocate transient command buffer");
+    }
+
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) {
+        vkDestroyCommandPool(m_ctx.device(), pool, nullptr);
+        pool = VK_NULL_HANDLE;
+        throw std::runtime_error("[App] Failed to begin transient command buffer");
+    }
+    return cmd;
+}
+
+void Application::endImmediateCommands(VkCommandPool pool, VkCommandBuffer cmd) const {
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+        vkDestroyCommandPool(m_ctx.device(), pool, nullptr);
+        throw std::runtime_error("[App] Failed to end transient command buffer");
+    }
+
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers    = &cmd;
+    if (vkQueueSubmit(m_ctx.graphicsQueue(), 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS) {
+        vkDestroyCommandPool(m_ctx.device(), pool, nullptr);
+        throw std::runtime_error("[App] Failed to submit transient command buffer");
+    }
+    vkQueueWaitIdle(m_ctx.graphicsQueue());
+    vkDestroyCommandPool(m_ctx.device(), pool, nullptr);
+}
+
+void Application::updateSolidCubemap(Image& image, const glm::vec4& color) {
+    if (image.handle() == VK_NULL_HANDLE) return;
+
+    const uint32_t width     = std::max(1u, image.width());
+    const uint32_t height    = std::max(1u, image.height());
+    const uint32_t mipLevels = std::max(1u, image.mipLevels());
+    const uint32_t layers    = std::max(1u, image.arrayLayers());
+    const bool isHalf        = image.format() == VK_FORMAT_R16G16B16A16_SFLOAT;
+
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = beginImmediateCommands(pool);
+    std::vector<Buffer> staging;
+    staging.reserve(mipLevels);
+
+    Image::transitionLayout(cmd, image.handle(),
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            mipLevels, VK_IMAGE_ASPECT_COLOR_BIT, layers);
+
+    for (uint32_t mip = 0; mip < mipLevels; ++mip) {
+        const uint32_t mipWidth  = std::max(1u, width >> mip);
+        const uint32_t mipHeight = std::max(1u, height >> mip);
+        const VkDeviceSize bytesPerPixel = isHalf ? 8 : 4;
+        const VkDeviceSize bytesPerLayer =
+            static_cast<VkDeviceSize>(mipWidth) * mipHeight * bytesPerPixel;
+        const VkDeviceSize totalBytes = bytesPerLayer * layers;
+
+        auto& stg = staging.emplace_back();
+        stg.createCpuVisible(m_allocator.handle(), totalBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+
+        if (isHalf) {
+            std::vector<uint16_t> pixels(static_cast<size_t>(mipWidth) * mipHeight * layers * 4u);
+            const std::array<uint16_t, 4> halfColor{
+                floatToHalfBits(color.r),
+                floatToHalfBits(color.g),
+                floatToHalfBits(color.b),
+                floatToHalfBits(color.a),
+            };
+            for (size_t i = 0; i < pixels.size(); i += 4) {
+                pixels[i + 0] = halfColor[0];
+                pixels[i + 1] = halfColor[1];
+                pixels[i + 2] = halfColor[2];
+                pixels[i + 3] = halfColor[3];
+            }
+            stg.uploadData(pixels.data(), totalBytes);
+        } else {
+            const std::array<uint8_t, 4> rgba8{
+                static_cast<uint8_t>(std::clamp(color.r, 0.0f, 1.0f) * 255.0f),
+                static_cast<uint8_t>(std::clamp(color.g, 0.0f, 1.0f) * 255.0f),
+                static_cast<uint8_t>(std::clamp(color.b, 0.0f, 1.0f) * 255.0f),
+                static_cast<uint8_t>(std::clamp(color.a, 0.0f, 1.0f) * 255.0f),
+            };
+            std::vector<uint8_t> pixels(static_cast<size_t>(totalBytes));
+            for (size_t i = 0; i < pixels.size(); i += 4) {
+                pixels[i + 0] = rgba8[0];
+                pixels[i + 1] = rgba8[1];
+                pixels[i + 2] = rgba8[2];
+                pixels[i + 3] = rgba8[3];
+            }
+            stg.uploadData(pixels.data(), totalBytes);
+        }
+
+        std::vector<VkBufferImageCopy> regions;
+        regions.reserve(layers);
+        for (uint32_t layer = 0; layer < layers; ++layer) {
+            VkBufferImageCopy region{};
+            region.bufferOffset      = bytesPerLayer * layer;
+            region.imageSubresource  = {VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1};
+            region.imageExtent       = {mipWidth, mipHeight, 1};
+            regions.push_back(region);
+        }
+        vkCmdCopyBufferToImage(cmd, stg.handle(), image.handle(),
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               static_cast<uint32_t>(regions.size()), regions.data());
+    }
+
+    Image::transitionLayout(cmd, image.handle(),
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            mipLevels, VK_IMAGE_ASPECT_COLOR_BIT, layers);
+    endImmediateCommands(pool, cmd);
+}
+
+void Application::updateSolidImage2D(Image& image, const glm::vec4& color) {
+    if (image.handle() == VK_NULL_HANDLE) return;
+
+    const VkDeviceSize bytesPerPixel =
+        image.format() == VK_FORMAT_R16G16_SFLOAT ? 4 : 4;
+    const VkDeviceSize totalBytes =
+        static_cast<VkDeviceSize>(std::max(1u, image.width())) * std::max(1u, image.height()) * bytesPerPixel;
+
+    Buffer staging;
+    staging.createCpuVisible(m_allocator.handle(), totalBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+
+    if (image.format() == VK_FORMAT_R16G16_SFLOAT) {
+        std::vector<uint16_t> pixels(static_cast<size_t>(image.width()) * image.height() * 2u);
+        const uint16_t x = floatToHalfBits(color.r);
+        const uint16_t y = floatToHalfBits(color.g);
+        for (size_t i = 0; i < pixels.size(); i += 2) {
+            pixels[i + 0] = x;
+            pixels[i + 1] = y;
+        }
+        staging.uploadData(pixels.data(), totalBytes);
+    } else {
+        std::vector<uint8_t> pixels(static_cast<size_t>(totalBytes));
+        const uint8_t x = static_cast<uint8_t>(std::clamp(color.r, 0.0f, 1.0f) * 255.0f);
+        const uint8_t y = static_cast<uint8_t>(std::clamp(color.g, 0.0f, 1.0f) * 255.0f);
+        for (size_t i = 0; i < pixels.size(); i += 2) {
+            pixels[i + 0] = x;
+            pixels[i + 1] = y;
+        }
+        staging.uploadData(pixels.data(), totalBytes);
+    }
+
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = beginImmediateCommands(pool);
+    Image::transitionLayout(cmd, image.handle(),
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    Image::copyFromBuffer(cmd, staging.handle(), image.handle(),
+                          std::max(1u, image.width()), std::max(1u, image.height()));
+    Image::transitionLayout(cmd, image.handle(),
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    endImmediateCommands(pool, cmd);
+    staging.destroy();
+}
+
+// -- IBL resources (placeholder textures) -------------------------------------
+
+void Application::createIblResources() {
+    // Samplers are always created; they are shared by both the baked and placeholder paths.
+    m_iblCubeSampler.create(m_ctx.device(), m_ctx.physicalDevice(), Sampler::clampConfig());
+    m_iblLutSampler.create(m_ctx.device(), m_ctx.physicalDevice(), Sampler::clampConfig());
+
+    if (!m_cfg.iblPath.empty()) {
+        // Full IBL bake from equirectangular HDR panorama.
+        IblBaker::Config bakerCfg;
+        bakerCfg.prefilterMips = static_cast<uint32_t>(m_cfg.iblMaxPrefilterLod + 1);
+
+        m_iblBaker.init(
+            m_ctx.device(),
+            m_ctx.physicalDevice(),
+            m_allocator.handle(),
+            m_ctx.graphicsQueue(),
+            m_ctx.graphicsQueueIndex(),
+            resolveShaderPath("equirect_to_cube.comp.spv"),
+            resolveShaderPath("irradiance_conv.comp.spv"),
+            resolveShaderPath("prefilter_env.comp.spv"),
+            bakerCfg);
+
+        auto result      = m_iblBaker.bake(m_cfg.iblPath);
+        m_iblIrradiance  = std::move(result.irradiance);
+        m_iblPrefilter   = std::move(result.prefilter);
+        m_iblBrdfLut     = std::move(result.brdfLut);
+        m_iblEnvCubemap  = std::move(result.envCubemap);
+        m_iblBaker.destroy(); // pipelines no longer needed after baking
+
+        m_cfg.iblEnabled = true; // auto-enable when a path is provided
+        m_iblBakedMaxPrefilterLod = static_cast<int>(m_iblPrefilter.mipLevels()) - 1;
+
+        // Give the sky pass the baked env cubemap so it renders the environment
+        // instead of the 1x1 black placeholder. setCubemap() also switches the
+        // mode to SkyMode::Skybox automatically.
+        m_skyPass.setCubemap(m_iblEnvCubemap.view(), m_iblCubeSampler.handle());
+
+        updateIblDescriptors();
+        return;
+    }
+
+    // Placeholder path: 1x1 black cubemaps + flat BRDF LUT.
+    // When iblEnabled is false these are bound but not meaningfully sampled
+    // (the shader branches on ubo.iblParams.x).
+
+    VkCommandBuffer uploadCmd = VK_NULL_HANDLE;
+    VkCommandPool   tmpPool   = VK_NULL_HANDLE;
+    VkQueue         queue     = VK_NULL_HANDLE;
+    vkGetDeviceQueue(m_ctx.device(), m_ctx.graphicsQueueIndex(), 0, &queue);
+
+    {
+        VkCommandPoolCreateInfo poolInfo{};
+        poolInfo.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        poolInfo.queueFamilyIndex = m_ctx.graphicsQueueIndex();
+        poolInfo.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+        if (vkCreateCommandPool(m_ctx.device(), &poolInfo, nullptr, &tmpPool) != VK_SUCCESS)
+            throw std::runtime_error("[App] IBL: Failed to create temporary command pool");
+
+        VkCommandBufferAllocateInfo cbInfo{};
+        cbInfo.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cbInfo.commandPool        = tmpPool;
+        cbInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbInfo.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(m_ctx.device(), &cbInfo, &uploadCmd) != VK_SUCCESS) {
+            vkDestroyCommandPool(m_ctx.device(), tmpPool, nullptr);
+            throw std::runtime_error("[App] IBL: Failed to allocate upload command buffer");
+        }
+    }
+
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(uploadCmd, &begin);
+
+    // All staging buffers held alive until after queue submission.
+    std::vector<Buffer> staging;
+
+    // Helper: create a 1x1 black RGBA8 cubemap (6 faces, CUBE_COMPATIBLE).
+    auto makePlaceholderCube = [&](Image& img) {
+        img.create(m_allocator.handle(), m_ctx.device(), {
+            1, 1, VK_FORMAT_R8G8B8A8_UNORM,
+            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT, 1,
+            VK_SAMPLE_COUNT_1_BIT,
+            6,  // arrayLayers
+            VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT
+        });
+
+        constexpr uint32_t kFaces     = 6;
+        constexpr uint32_t kBytesEach = 4;  // 1x1 RGBA8
+        uint8_t pixels[kFaces * kBytesEach] = {};
+        for (uint32_t i = 0; i < kFaces; ++i) pixels[i * 4 + 3] = 255; // alpha=255
+
+        auto& stg = staging.emplace_back();
+        stg.createCpuVisible(m_allocator.handle(), kFaces * kBytesEach,
+                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        stg.uploadData(pixels, kFaces * kBytesEach);
+
+        Image::transitionLayout(uploadCmd, img.handle(),
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1, VK_IMAGE_ASPECT_COLOR_BIT, 6);
+        Image::copyFromBufferLayers(uploadCmd, stg.handle(), img.handle(),
+                                    1, 1, kFaces, kBytesEach);
+        Image::transitionLayout(uploadCmd, img.handle(),
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            1, VK_IMAGE_ASPECT_COLOR_BIT, 6);
+    };
+
+    // Irradiance cubemap placeholder (black = no IBL diffuse).
+    makePlaceholderCube(m_iblIrradiance);
+
+    // Prefiltered env cubemap placeholder (black = no IBL specular).
+    makePlaceholderCube(m_iblPrefilter);
+
+    // Environment cubemap placeholder used when a runtime probe refresh updates the sky-driven IBL.
+    makePlaceholderCube(m_iblEnvCubemap);
+
+    // BRDF LUT placeholder: R8G8_UNORM 64x64, value (128,128) = (0.5, 0.5).
+    // This approximates a mid-range split-sum result for all roughness/NdotV values.
+    {
+        constexpr uint32_t kSize  = 64;
+        constexpr uint32_t kBytes = kSize * kSize * 2;  // R8G8
+        m_iblBrdfLut.create(m_allocator.handle(), m_ctx.device(), {
+            kSize, kSize, VK_FORMAT_R8G8_UNORM,
+            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT, 1
+        });
+
+        std::vector<uint8_t> lutPixels(kBytes, 128);  // (0.5, 0.5) for all texels
+
+        auto& stg = staging.emplace_back();
+        stg.createCpuVisible(m_allocator.handle(), kBytes,
+                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        stg.uploadData(lutPixels.data(), kBytes);
+
+        Image::transitionLayout(uploadCmd, m_iblBrdfLut.handle(),
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        Image::copyFromBuffer(uploadCmd, stg.handle(), m_iblBrdfLut.handle(), kSize, kSize);
+        Image::transitionLayout(uploadCmd, m_iblBrdfLut.handle(),
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+
+    vkEndCommandBuffer(uploadCmd);
+
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers    = &uploadCmd;
+    vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue);
+
+    vkDestroyCommandPool(m_ctx.device(), tmpPool, nullptr);
+    staging.clear();
+
+    updateIblDescriptors();
+    m_iblBakedMaxPrefilterLod = std::max(0, static_cast<int>(m_iblPrefilter.mipLevels()) - 1);
+}
+
+void Application::updateIblDescriptors() {
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        DescriptorWriter{}
+            .writeImage(4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                        m_iblIrradiance.view(), m_iblCubeSampler.handle(),
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+            .writeImage(5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                        m_iblPrefilter.view(), m_iblCubeSampler.handle(),
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+            .writeImage(6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                        m_iblBrdfLut.view(), m_iblLutSampler.handle(),
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+            .update(m_ctx.device(), m_globalSets[i]);
+    }
+}
+
+void Application::rebuildSkyIblProbe() {
+    if (!m_cfg.iblPath.empty() && m_skyPass.mode() == SkyMode::Skybox) {
+        m_skyPass.markCaptureComplete();
+        m_lastSkyProbeUpdateTime = m_animTime;
+        return;
+    }
+
+    glm::vec4 probeColor{0.0f, 0.0f, 0.0f, 1.0f};
+    if (m_skyPass.mode() == SkyMode::Color || m_skyPass.mode() == SkyMode::SkySphere)
+        probeColor = glm::vec4(m_skyPass.skyColor(), 1.0f);
+
+    updateSolidCubemap(m_iblIrradiance, probeColor);
+    updateSolidCubemap(m_iblPrefilter, probeColor);
+    if (m_iblEnvCubemap.handle() != VK_NULL_HANDLE)
+        updateSolidCubemap(m_iblEnvCubemap, probeColor);
+    updateSolidImage2D(m_iblBrdfLut, {0.5f, 0.5f, 0.0f, 1.0f});
+    updateIblDescriptors();
+
+    m_lastSkyProbeUpdateTime = m_animTime;
+    m_skyPass.markCaptureComplete();
+}
+
+// -- Sky pass ------------------------------------------------------------------
+
+void Application::createSkyPass(const Config& cfg) {
+    m_skyPass.init(
+        m_ctx.device(),
+        m_allocator.handle(),
+        m_globalLayout,
+        m_descriptorPool.handle(),
+        m_pipelineCache,
+        m_postProcess.hdrRenderPass(),
+        VK_SAMPLE_COUNT_1_BIT,   // HDR offscreen pass is always 1x MSAA
+        resolveShaderPath("skybox.vert.spv"),
+        resolveShaderPath("skybox.frag.spv"),
+        m_ctx.graphicsQueueIndex(),
+        cfg.sky);
 }
 
 // -- Pipeline cache -------------------------------------------------------------
@@ -464,6 +944,414 @@ void Application::createPipeline() {
                          m_pipeline, "Main Pipeline");
     debug::setObjectName(m_ctx.device(), VK_OBJECT_TYPE_PIPELINE_LAYOUT,
                          m_pipelineLayout, "Main Pipeline Layout");
+
+    // G2: Create bindless pipeline variant (default_bindless.frag + bindless layout).
+    // Layout: set=0 global, set=1 bindless array (replaces per-material set=1).
+    if (m_useBindless) {
+        std::array<VkDescriptorSetLayout, 2> bindlessLayouts{
+            m_globalLayout, m_bindlessSet.layout()
+        };
+        VkPipelineLayoutCreateInfo bindlessLayoutInfo{};
+        bindlessLayoutInfo.sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        bindlessLayoutInfo.setLayoutCount = static_cast<uint32_t>(bindlessLayouts.size());
+        bindlessLayoutInfo.pSetLayouts    = bindlessLayouts.data();
+
+        if (vkCreatePipelineLayout(m_ctx.device(), &bindlessLayoutInfo, nullptr,
+                                   &m_bindlessPipelineLayout) != VK_SUCCESS)
+            throw std::runtime_error("[App] Failed to create bindless pipeline layout");
+
+        Shader bindlessFrag;
+        bindlessFrag.load(m_ctx.device(), resolveShaderPath("default_bindless.frag.spv"));
+        auto bindlessFragStage = bindlessFrag.stageInfo(VK_SHADER_STAGE_FRAGMENT_BIT);
+        bindlessFragStage.pSpecializationInfo = &fragSpecs;
+
+        m_bindlessPipeline = PipelineBuilder{}
+            .addShaderStage(vertStage)
+            .addShaderStage(bindlessFragStage)
+            .setVertexInput(bindings, attrs)
+            .setDepthTest(true, true)
+            .setCullMode(VK_CULL_MODE_BACK_BIT)
+            .setMultisampling(VK_SAMPLE_COUNT_1_BIT)
+            .build(m_ctx.device(), m_bindlessPipelineLayout,
+                   m_postProcess.hdrRenderPass(), 0, m_pipelineCache);
+
+        debug::setObjectName(m_ctx.device(), VK_OBJECT_TYPE_PIPELINE,
+                             m_bindlessPipeline, "Main Pipeline (Bindless)");
+        debug::setObjectName(m_ctx.device(), VK_OBJECT_TYPE_PIPELINE_LAYOUT,
+                             m_bindlessPipelineLayout, "Bindless Pipeline Layout");
+    }
+}
+
+// -- Async streaming ----------------------------------------------------------
+
+// -- Track F: Pipeline Hot Reload ---------------------------------------------
+
+void Application::createShaderWatcher() {
+    const std::string exeDir   = platform::getExeDir().string();
+    const std::string sourceDir = ShaderWatcher::findSourceDir(exeDir);
+    // Output SPV files live in <exe>/shaders/ (where resolveShaderPath searches).
+    const std::string outputDir =
+        (fs::path(platform::getExeDir()) / "shaders").string();
+    const std::string glslcPath = ShaderWatcher::findGlslc();
+
+    // Only the main geometry shaders are hot-reloadable via this watcher.
+    // Shadow/post/cull pipelines are more complex to rebuild and are excluded.
+    // G2: include default_bindless.frag so the bindless variant is also reloaded.
+    m_shaderWatcher.init(glslcPath, sourceDir, outputDir,
+                         {"default.vert", "default.frag", "default_bindless.frag"});
+}
+
+bool Application::tryHotReloadPipeline() {
+    if (!m_shaderWatcher.consumeReady()) return false;
+
+    // Build the new pipeline(s). Use the updated SPV files that the watcher compiled.
+    VkPipeline newPipeline         = VK_NULL_HANDLE;
+    VkPipeline newBindlessPipeline = VK_NULL_HANDLE;
+    try {
+        Shader vert, frag;
+        vert.load(m_ctx.device(), resolveShaderPath("default.vert.spv"));
+        frag.load(m_ctx.device(), resolveShaderPath("default.frag.spv"));
+
+        VkSpecializationMapEntry lightCapEntry{};
+        lightCapEntry.constantID = 0;
+        lightCapEntry.offset     = offsetof(ShaderSpecializationConstants, lightCap);
+        lightCapEntry.size       = sizeof(ShaderSpecializationConstants::lightCap);
+
+        VkSpecializationInfo fragSpecs{};
+        fragSpecs.mapEntryCount = 1;
+        fragSpecs.pMapEntries   = &lightCapEntry;
+        fragSpecs.dataSize      = sizeof(ShaderSpecializationConstants);
+        fragSpecs.pData         = &m_shaderSpecs;
+
+        auto vertStage = vert.stageInfo(VK_SHADER_STAGE_VERTEX_BIT);
+        auto fragStage = frag.stageInfo(VK_SHADER_STAGE_FRAGMENT_BIT);
+        fragStage.pSpecializationInfo = &fragSpecs;
+
+        auto binding    = Vertex::bindingDesc();
+        auto attributes = Vertex::attributeDescs();
+        std::vector<VkVertexInputBindingDescription>   bindings{binding};
+        std::vector<VkVertexInputAttributeDescription> attrs{attributes.begin(), attributes.end()};
+
+        newPipeline = PipelineBuilder{}
+            .addShaderStage(vertStage)
+            .addShaderStage(fragStage)
+            .setVertexInput(bindings, attrs)
+            .setDepthTest(true, true)
+            .setCullMode(VK_CULL_MODE_BACK_BIT)
+            .setMultisampling(VK_SAMPLE_COUNT_1_BIT)
+            .build(m_ctx.device(), m_pipelineLayout,
+                   m_postProcess.hdrRenderPass(), 0, m_pipelineCache);
+
+        // G2: Also rebuild bindless pipeline if active.
+        if (m_useBindless) {
+            Shader bindlessFrag;
+            bindlessFrag.load(m_ctx.device(),
+                              resolveShaderPath("default_bindless.frag.spv"));
+            auto bindlessFragStage = bindlessFrag.stageInfo(VK_SHADER_STAGE_FRAGMENT_BIT);
+            bindlessFragStage.pSpecializationInfo = &fragSpecs;
+
+            newBindlessPipeline = PipelineBuilder{}
+                .addShaderStage(vertStage)
+                .addShaderStage(bindlessFragStage)
+                .setVertexInput(bindings, attrs)
+                .setDepthTest(true, true)
+                .setCullMode(VK_CULL_MODE_BACK_BIT)
+                .setMultisampling(VK_SAMPLE_COUNT_1_BIT)
+                .build(m_ctx.device(), m_bindlessPipelineLayout,
+                       m_postProcess.hdrRenderPass(), 0, m_pipelineCache);
+        }
+    } catch (const std::exception& e) {
+        if (newPipeline != VK_NULL_HANDLE)
+            vkDestroyPipeline(m_ctx.device(), newPipeline, nullptr);
+        if (newBindlessPipeline != VK_NULL_HANDLE)
+            vkDestroyPipeline(m_ctx.device(), newBindlessPipeline, nullptr);
+        std::fprintf(stderr, "[HotReload] Pipeline rebuild failed: %s\n", e.what());
+        return false;
+    }
+
+    if (newPipeline == VK_NULL_HANDLE) return false;
+
+    // F2: Queue old pipelines for deferred destruction after MAX_FRAMES_IN_FLIGHT frames.
+    const uint64_t safeFrame = m_frameCount + static_cast<uint64_t>(MAX_FRAMES_IN_FLIGHT);
+    m_deferredPipelineDestroys.push_back({m_pipeline, safeFrame});
+    m_pipeline = newPipeline;
+    debug::setObjectName(m_ctx.device(), VK_OBJECT_TYPE_PIPELINE,
+                         m_pipeline, "Main Pipeline (Hot Reloaded)");
+
+    if (newBindlessPipeline != VK_NULL_HANDLE) {
+        m_deferredPipelineDestroys.push_back({m_bindlessPipeline, safeFrame});
+        m_bindlessPipeline = newBindlessPipeline;
+        debug::setObjectName(m_ctx.device(), VK_OBJECT_TYPE_PIPELINE,
+                             m_bindlessPipeline, "Main Pipeline Bindless (Hot Reloaded)");
+    }
+
+    std::printf("[HotReload] Main pipeline(s) reloaded successfully.\n");
+    return true;
+}
+
+void Application::createStreamLoader() {
+    // Use the 1x1 white placeholder image so any in-flight request renders
+    // a solid white texel instead of crashing from a null descriptor.
+    StreamLoader::Config cfg;
+    cfg.maxQueueDepth = 32;
+    cfg.workerThreads = 2;
+    m_streamLoader.init(
+        m_ctx.device(), m_ctx.physicalDevice(), m_allocator.handle(),
+        m_ctx.graphicsQueue(), m_ctx.graphicsQueueIndex(),
+        m_defaultImage.view(), m_defaultSampler.handle(),
+        cfg);
+}
+
+// -- Render graph -------------------------------------------------------------
+
+void Application::createRenderGraph() {
+    m_renderGraph.reset();
+
+    // Register resources: initial state = HOST_WRITE (CPU fills them in prepareFrameData
+    // before vkBeginCommandBuffer is called, so the barriers can be derived correctly).
+
+    // Instance SSBO: CPU -> shadow vertex -> compute r/w -> geometry vertex.
+    const auto rInstance = m_renderGraph.addBuffer({
+        "InstanceSSBO",
+        [this]{ return m_instanceBuffers[m_currentFrame].handle(); },
+        VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_WRITE_BIT
+    });
+    // Indirect buffer: CPU zero-fills -> compute atomicAdd -> draw-indirect reads.
+    const auto rIndirect = m_renderGraph.addBuffer({
+        "IndirectBuffer",
+        [this]{ return m_indirectBuffers[m_currentFrame].handle(); },
+        VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_WRITE_BIT
+    });
+    // Cull object SSBO: CPU writes bounding info -> compute reads for culling.
+    const auto rCullObj = m_renderGraph.addBuffer({
+        "CullObjectSSBO",
+        [this]{ return m_cullPass.objectBuffer(m_currentFrame); },
+        VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_WRITE_BIT
+    });
+
+    std::vector<RenderGraph::ResourceId> rShadowMaps;
+    rShadowMaps.reserve(m_shadowPass.cascadeCount());
+    for (uint32_t c = 0; c < m_shadowPass.cascadeCount(); ++c) {
+        rShadowMaps.push_back(m_renderGraph.addImage({
+            c == 0 ? "ShadowMap[0]" : (c == 1 ? "ShadowMap[1]" : (c == 2 ? "ShadowMap[2]" : "ShadowMap[3]")),
+            [this, c]{ return m_shadowPass.depthImage(c); },
+            VK_IMAGE_ASPECT_DEPTH_BIT,
+            1,
+            1,
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            0
+        }));
+    }
+
+    const auto rHdrColor = m_renderGraph.addImage({
+        "HdrColor",
+        [this]{ return m_postProcess.hdrImage(m_currentFrame); },
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        1,
+        1,
+        VK_IMAGE_LAYOUT_UNDEFINED,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        0
+    });
+    const auto rHdrDepth = m_renderGraph.addImage({
+        "HdrDepth",
+        [this]{ return m_postProcess.hdrDepthImage(); },
+        VK_IMAGE_ASPECT_DEPTH_BIT,
+        1,
+        1,
+        VK_IMAGE_LAYOUT_UNDEFINED,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        0
+    });
+    const auto rSwapchainColor = m_renderGraph.addImage({
+        "SwapchainColor",
+        [this]{ return m_swapchain.images()[m_currentImageIndex]; },
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        1,
+        1,
+        VK_IMAGE_LAYOUT_UNDEFINED,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        0
+    });
+    const auto rSwapchainDepth = m_renderGraph.addImage({
+        "SwapchainDepth",
+        [this]{ return m_swapchain.depthImage(); },
+        VK_IMAGE_ASPECT_DEPTH_BIT,
+        1,
+        1,
+        VK_IMAGE_LAYOUT_UNDEFINED,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        0
+    });
+    RenderGraph::ResourceId rSwapchainMsaa = RenderGraph::kInvalid;
+    if (m_swapchain.isMsaaEnabled()) {
+        rSwapchainMsaa = m_renderGraph.addImage({
+            "SwapchainMsaaColor",
+            [this]{ return m_swapchain.msaaImage(); },
+            VK_IMAGE_ASPECT_COLOR_BIT,
+            1,
+            1,
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            0
+        });
+    }
+
+    // Shadow: depth pre-pass; reads instance SSBO written by CPU.
+    // Derived barrier: HOST_WRITE -> VERTEX_SHADER_READ on instanceSSBO.
+    auto& shadowPass = m_renderGraph.addPass("Shadow", {0.8f, 0.4f, 0.1f, 1.0f},
+        [this](VkCommandBuffer cmd) {
+            if (m_shadowPass.enabled())
+                m_shadowPass.render(cmd, m_globalSets[m_currentFrame],
+                                    m_currentShadowBatches);
+        })
+        .readBuffer(rInstance, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+    for (const auto shadowMap : rShadowMaps) {
+        shadowPass.writeAttachmentImage(
+            shadowMap,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_SHADER_READ_BIT,
+            VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+    }
+
+    // GPU Cull: compute frustum culling.
+    // Derived barrier: HOST_WRITE(cullObj,indirect) + VERTEX_SHADER_READ(instance)
+    //   -> COMPUTE_SHADER_READ|WRITE on all three buffers.
+    m_renderGraph.addPass("GPU Cull", {0.5f, 0.9f, 0.5f, 1.0f},
+        [this](VkCommandBuffer cmd) {
+            const Frustum frustum = Frustum::fromVP(m_viewProj);
+            m_cullPass.dispatch(cmd, m_currentFrame,
+                                frustum.planes.data(), m_currentObjectCount);
+        })
+        .readBuffer(rCullObj, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT)
+        .readWriteBuffer(rInstance, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT)
+        .readWriteBuffer(rIndirect, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+
+    // HDR Geometry: sky + main geometry via GPU-culled indirect draw.
+    // Derived barrier: COMPUTE_SHADER_WRITE(instance,indirect)
+    //   -> VERTEX_SHADER_READ(instance) + DRAW_INDIRECT_READ(indirect).
+    // G3: selects between bindless path (single set=1 bind) and per-batch path.
+    auto& hdrPass = m_renderGraph.addPass("HDR Geometry", {0.2f, 0.6f, 0.9f, 1.0f},
+        [this](VkCommandBuffer cmd) {
+            m_postProcess.beginHdr(cmd, m_currentFrame);
+            m_skyPass.draw(cmd, m_globalSets[m_currentFrame]);
+            if (m_useBindless) {
+                // G2: bind bindless pipeline + global set + bindless texture array once.
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_bindlessPipeline);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                        m_bindlessPipelineLayout, 0, 1,
+                                        &m_globalSets[m_currentFrame], 0, nullptr);
+                const VkDescriptorSet bindlessSet = m_bindlessSet.handle();
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                        m_bindlessPipelineLayout, 1, 1,
+                                        &bindlessSet, 0, nullptr);
+                m_world.drawIndirect(cmd, m_bindlessPipelineLayout, m_currentCullBatches,
+                                     m_indirectBuffers[m_currentFrame].handle(),
+                                     true /*skipTextureBinds*/);
+            } else {
+                // G3: non-bindless fallback -- per-batch texture set binds.
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                        m_pipelineLayout, 0, 1,
+                                        &m_globalSets[m_currentFrame], 0, nullptr);
+                m_world.drawIndirect(cmd, m_pipelineLayout, m_currentCullBatches,
+                                     m_indirectBuffers[m_currentFrame].handle());
+            }
+            m_postProcess.endHdr(cmd);
+        })
+        .readBuffer(rInstance, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT)
+        .readBuffer(rIndirect, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                    VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+    for (const auto shadowMap : rShadowMaps) {
+        hdrPass.readImage(
+            shadowMap,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_SHADER_READ_BIT,
+            VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+    }
+    hdrPass
+        .writeAttachmentImage(
+            rHdrColor,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_SHADER_READ_BIT,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+        .writeAttachmentImage(
+            rHdrDepth,
+            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
+    // Swapchain: tonemap blit + ImGui UI.
+    auto& swapchainPass = m_renderGraph.addPass("Swapchain", {0.6f, 0.9f, 0.2f, 1.0f},
+        [this](VkCommandBuffer cmd) {
+            m_renderPass.begin(cmd, m_currentImageIndex);
+            m_postProcess.blit(cmd, m_currentFrame);
+            m_imgui.newFrame();
+            renderUI();
+            m_imgui.render(cmd);
+            m_renderPass.end(cmd);
+        })
+        .readImage(rHdrColor, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                   VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+        .writeAttachmentImage(
+            rSwapchainColor,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            0,
+            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
+        .writeAttachmentImage(
+            rSwapchainDepth,
+            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    if (rSwapchainMsaa != RenderGraph::kInvalid) {
+        swapchainPass.writeAttachmentImage(
+            rSwapchainMsaa,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    }
+
+    m_renderGraph.compile();
+}
+
+// CPU-side frame setup: populate batch lists and flush per-frame GPU buffers.
+// All HOST writes must complete before m_renderGraph.execute() records any GPU commands.
+void Application::prepareFrameData() {
+    // Shadow batches: all alive objects including off-screen casters so they can
+    // cast shadows into the camera view. Compute cull overwrites instance SSBO after.
+    InstanceBuffer& ib = m_instanceBuffers[m_currentFrame];
+    m_currentShadowBatches = m_world.buildBatchesNoCull(
+        ib.data(), ib.capacity(), m_camera.worldPosition());
+    uint32_t shadowInstanceCount = 0;
+    for (const auto& b : m_currentShadowBatches) shadowInstanceCount += b.count;
+    ib.flush(shadowInstanceCount);
+
+    // Flush material edits staged via the UI this frame (no-op if nothing changed).
+    m_materials.flush();
+
+    // Cull data: fill the CullObject SSBO (inside CullPass) and the indirect buffer.
+    // CullPass::dispatch() will flush the CullObject SSBO before vkCmdDispatch.
+    m_currentCullBatches.clear();
+    m_currentObjectCount = m_world.buildCullData(
+        m_cullPass.objectData(m_currentFrame),
+        m_cullPass.objectCapacity(),
+        RenderLimits::kMaxBatches,
+        m_currentCullBatches,
+        m_camera.worldPosition());
+
+    IndirectBuffer& indr = m_indirectBuffers[m_currentFrame];
+    for (const auto& b : m_currentCullBatches) {
+        auto& entry         = indr.data()[b.batchId];
+        entry.indexCount    = b.mesh->indexCount();
+        entry.instanceCount = 0;  // GPU compute fills this via atomicAdd
+        entry.firstIndex    = 0;  // each Mesh has a dedicated index buffer starting at 0
+        entry.vertexOffset  = 0;  // no base-vertex offset
+        entry.firstInstance = b.firstInstance;
+    }
+    indr.flush(static_cast<uint32_t>(m_currentCullBatches.size()));
 }
 
 // -- Scene ----------------------------------------------------------------------
@@ -511,36 +1399,88 @@ void Application::loadScene() {
                                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 1);
         }
 
+        // -- Default 1x1 flat normal map ------------------------------------------
+        // Tangent-space neutral up-vector: (128, 128, 255, 255) in RGBA8.
+        // Written to binding 1 of every material set that lacks a real normal texture.
+        {
+            m_defaultNormalImage.create(m_allocator.handle(), m_ctx.device(), {
+                1, 1, VK_FORMAT_R8G8B8A8_UNORM,
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                VK_IMAGE_ASPECT_COLOR_BIT, 1
+            });
+            constexpr uint8_t flatNormal[4] = {128, 128, 255, 255};
+            auto& nStg = staging.emplace_back();
+            nStg.createCpuVisible(m_allocator.handle(), 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            nStg.uploadData(flatNormal, 4);
+            Image::transitionLayout(uploadCmd, m_defaultNormalImage.handle(),
+                                    VK_IMAGE_LAYOUT_UNDEFINED,
+                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1);
+            Image::copyFromBuffer(uploadCmd, nStg.handle(), m_defaultNormalImage.handle(), 1, 1);
+            Image::transitionLayout(uploadCmd, m_defaultNormalImage.handle(),
+                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 1);
+        }
+
         m_defaultSampler.create(m_ctx.device(), m_ctx.physicalDevice(), Sampler::linearConfig());
+        m_defaultNormalSampler.create(m_ctx.device(), m_ctx.physicalDevice(), Sampler::linearConfig());
+
         m_defaultMaterialSet = m_descriptorPool.allocate(m_materialLayout);
         DescriptorWriter{}
             .writeImage(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                         m_defaultImage.view(), m_defaultSampler.handle(),
                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+            .writeImage(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                        m_defaultNormalImage.view(), m_defaultNormalSampler.handle(),
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
             .update(m_ctx.device(), m_defaultMaterialSet);
         debug::setObjectName(m_ctx.device(), VK_OBJECT_TYPE_IMAGE,
                              m_defaultImage.handle(), "Default White Texture");
+        debug::setObjectName(m_ctx.device(), VK_OBJECT_TYPE_IMAGE,
+                             m_defaultNormalImage.handle(), "Default Flat Normal Map");
 
         // Register with the world so SceneLoader / user code can look it up by name.
         m_world.registerTexture("default", m_defaultMaterialSet);
+
+        // G1: Register default textures into the bindless array.
+        // Slot 0 = default white albedo, slot 1 = default flat normal.
+        // These indices are passed to SceneLoader and used for materials with no texture.
+        if (m_useBindless) {
+            m_bindlessSet.registerTexture(m_ctx.device(),
+                m_defaultImage.view(), m_defaultSampler.handle());           // idx 0
+            m_bindlessSet.registerTexture(m_ctx.device(),
+                m_defaultNormalImage.view(), m_defaultNormalSampler.handle()); // idx 1
+        }
 
         // -- Scene objects ---------------------------------------------------------
         // -- Demo materials --------------------------------------------------------
         // Registered before scene objects so IDs can be passed to spawn().
         // Index 0 is always the default white material (registered in init()).
         const uint32_t matGround = m_materials.add("ground",
-            GPUMaterial{ {0.45f, 0.45f, 0.45f, 1.0f} });          // dark grey
+            GPUMaterial{ {0.45f, 0.45f, 0.45f, 1.0f}, 0.8f, 0.0f, 0.0f, 0 }); // dark grey
+        // Sphere: blue metallic PBR material (UsePBR flag = bit2).
         const uint32_t matSphere = m_materials.add("sphere",
-            GPUMaterial{ {0.2f, 0.6f, 1.0f, 1.0f}, 0.5f, 0.0f, 0.4f }); // blue+glow
+            GPUMaterial{ {0.2f, 0.6f, 1.0f, 1.0f}, 0.3f, 0.8f, 0.4f,
+                         MaterialFlags::UsePBR });   // blue metallic + glow + PBR
         const uint32_t matCube   = m_materials.add("cube",
-            GPUMaterial{ {1.0f, 0.35f, 0.1f, 1.0f} });             // orange
+            GPUMaterial{ {1.0f, 0.35f, 0.1f, 1.0f}, 0.5f, 0.0f, 0.0f, 0 }); // orange
 
         if (!m_cfg.sceneFile.empty()) {
             // File-based path: SceneLoader creates meshes, loads textures, spawns objects.
-            SceneLoadContext ctx{
-                m_allocator.handle(), m_ctx.device(), m_ctx.physicalDevice(),
-                uploadCmd, &m_descriptorPool, m_materialLayout
-            };
+            SceneLoadContext ctx{};
+            ctx.allocator            = m_allocator.handle();
+            ctx.device               = m_ctx.device();
+            ctx.physDevice           = m_ctx.physicalDevice();
+            ctx.uploadCmd            = uploadCmd;
+            ctx.descriptorPool       = &m_descriptorPool;
+            ctx.materialLayout       = m_materialLayout;
+            ctx.materials            = &m_materials;
+            ctx.defaultAlbedoView    = m_defaultImage.view();
+            ctx.defaultAlbedoSampler = m_defaultSampler.handle();
+            ctx.defaultNormalView          = m_defaultNormalImage.view();
+            ctx.defaultNormalSampler       = m_defaultNormalSampler.handle();
+            ctx.bindlessSet                = m_useBindless ? &m_bindlessSet : nullptr;
+            ctx.defaultAlbedoBindlessIdx   = 0; // default white at slot 0
+            ctx.defaultNormalBindlessIdx   = 1; // default normal at slot 1
             SceneLoader::load(ctx, m_world, m_cfg.sceneFile, staging, m_sceneTextures);
             // m_groundId / m_sphereId / m_cubeId stay INVALID_HANDLE; animation skipped.
         } else {
@@ -694,6 +1634,7 @@ void Application::run() {
         m_animTime += dt;
         onBeforeDraw(doubleDt);
         drawFrame();
+        if (m_deviceLost) break;
 
         // Software FPS cap: sleep+spin hybrid.
         // Sleep covers most of the remaining budget (OS-scheduled, low CPU),
@@ -710,8 +1651,10 @@ void Application::run() {
 #if defined(_WIN32)
     timeEndPeriod(1);
 #endif
-    if (vkDeviceWaitIdle(m_ctx.device()) != VK_SUCCESS)
-        throw std::runtime_error("[App] Failed while waiting for device idle at end of run");
+    if (!m_deviceLost) {
+        if (vkDeviceWaitIdle(m_ctx.device()) != VK_SUCCESS)
+            throw std::runtime_error("[App] Failed while waiting for device idle at end of run");
+    }
 }
 
 void Application::drawFrame() {
@@ -730,11 +1673,33 @@ void Application::drawFrame() {
 
     FrameData& f = m_frames[m_currentFrame];
 
-    if (vkWaitForFences(m_ctx.device(), 1, &f.inFlightFence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
-        throw std::runtime_error("[App] Failed while waiting for in-flight fence");
+    {
+        const VkResult r = vkWaitForFences(m_ctx.device(), 1, &f.inFlightFence, VK_TRUE, UINT64_MAX);
+        if (r == VK_ERROR_DEVICE_LOST) { reportDeviceLost(r, "vkWaitForFences"); return; }
+        if (r != VK_SUCCESS) throw std::runtime_error("[App] Failed while waiting for in-flight fence");
+    }
+
+    // E1: Retrieve GPU timestamps for this frame slot now that its GPU work is done.
+    // Skip the first MAX_FRAMES_IN_FLIGHT frames (query pools not yet written).
+    if (m_gpuTimestamps.supported() && m_frameCount >= static_cast<uint64_t>(MAX_FRAMES_IN_FLIGHT))
+        m_gpuTimestamps.retrieve(m_ctx.device(), m_currentFrame, m_timestampPeriod);
+
+    // F2: Destroy pipelines that are no longer in flight.
+    for (auto it = m_deferredPipelineDestroys.begin(); it != m_deferredPipelineDestroys.end(); ) {
+        if (m_frameCount >= it->destroyAfterFrame) {
+            vkDestroyPipeline(m_ctx.device(), it->pipeline, nullptr);
+            it = m_deferredPipelineDestroys.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // F1/F2: Check if ShaderWatcher compiled new SPIR-V; rebuild pipeline if so.
+    tryHotReloadPipeline();
 
     uint32_t imageIndex;
     VkResult acqResult = m_swapchain.acquireNextImage(f.imageAvailableSemaphore, imageIndex);
+    if (acqResult == VK_ERROR_DEVICE_LOST) { reportDeviceLost(acqResult, "vkAcquireNextImageKHR"); return; }
     if (acqResult == VK_ERROR_OUT_OF_DATE_KHR) {
         handleResize();
         return;
@@ -747,6 +1712,10 @@ void Application::drawFrame() {
 
     if (vkResetFences(m_ctx.device(), 1, &f.inFlightFence) != VK_SUCCESS)
         throw std::runtime_error("[App] Failed to reset in-flight fence");
+
+    // Async streaming: promote decoded results to GPU uploads and retire fences.
+    // Must run before recording commands so newly Ready textures can be used.
+    m_streamLoader.tick();
 
     // -- Update uniform buffer --------------------------------------------------
     // pack() fills the light array and returns the count atomically (one lock).
@@ -831,6 +1800,9 @@ void Application::drawFrame() {
     ubo.shadowMeta.x   = static_cast<int32_t>(cascadeCount);
     ubo.shadowMeta.y   = m_shadowPass.enabled() ? 1 : 0;
     ubo.shadowParams.x = m_shadowReceiverBias;
+    ubo.iblParams.x    = m_cfg.iblEnabled ? 1 : 0;
+    ubo.iblParams.y    = m_iblBakedMaxPrefilterLod;
+    ubo.iblParams.z    = m_debugVizMode;  // E3: debug visualization overlay mode
     m_uniformBuffers[m_currentFrame].uploadData(&ubo, sizeof(ubo));
     m_viewProj = ubo.proj * ubo.view;
 
@@ -874,8 +1846,11 @@ void Application::drawFrame() {
     submit.signalSemaphoreCount = 1;
     submit.pSignalSemaphores    = &renderFinished;
 
-    if (vkQueueSubmit(m_ctx.graphicsQueue(), 1, &submit, f.inFlightFence) != VK_SUCCESS)
-        throw std::runtime_error("[App] Queue submit failed");
+    {
+        const VkResult r = vkQueueSubmit(m_ctx.graphicsQueue(), 1, &submit, f.inFlightFence);
+        if (r == VK_ERROR_DEVICE_LOST) { reportDeviceLost(r, "vkQueueSubmit"); return; }
+        if (r != VK_SUCCESS) throw std::runtime_error("[App] Queue submit failed");
+    }
 
     VkSwapchainKHR sc = m_swapchain.handle();
     VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
@@ -886,119 +1861,42 @@ void Application::drawFrame() {
     present.pImageIndices      = &imageIndex;
 
     VkResult presResult = vkQueuePresentKHR(m_ctx.presentQueue(), &present);
+    if (presResult == VK_ERROR_DEVICE_LOST) { reportDeviceLost(presResult, "vkQueuePresentKHR"); return; }
     if (presResult == VK_ERROR_OUT_OF_DATE_KHR || presResult == VK_SUBOPTIMAL_KHR || m_framebufferResized) {
         handleResize();
     } else if (presResult != VK_SUCCESS) {
         throw std::runtime_error("[App] Failed to present swapchain image");
     }
 
+    if (m_skyPass.isCaptureStale()) {
+        if ((m_animTime - m_lastSkyProbeUpdateTime) >= m_skyProbeUpdateInterval)
+            rebuildSkyIblProbe();
+    }
+
     m_currentFrame = (m_currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
+    ++m_frameCount; // E1: used to skip timestamp retrieve for uninitialized slots
 }
 
 void Application::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex) {
-    // -- Shadow pass: CPU-built batches -----------------------------------------
-    // buildBatchesNoCull() writes all alive objects (up to SSBO capacity) so
-    // off-screen casters can still cast shadows into the camera view. The
-    // compute cull pass then overwrites the same SSBO for the main geometry pass.
-    InstanceBuffer& ib = m_instanceBuffers[m_currentFrame];
-    const auto shadowBatches = m_world.buildBatchesNoCull(
-        ib.data(), ib.capacity(), m_camera.worldPosition());
-    uint32_t shadowInstanceCount = 0;
-    for (const auto& b : shadowBatches) shadowInstanceCount += b.count;
-    ib.flush(shadowInstanceCount);
+    m_currentImageIndex = imageIndex;
 
-    // Flush material edits. No-op if no material was changed this frame.
-    m_materials.flush();
+    // E4: Optional frame capture marker for RenderDoc one-click capture.
+    // Wraps the entire frame in a named debug label (visible as a group in RenderDoc).
+    const bool doCapture = m_captureNextFrame;
+    m_captureNextFrame = false;
+    if (doCapture)
+        debug::beginLabel(cmd, "CAPTURE_FRAME", {1.0f, 0.5f, 0.0f, 1.0f});
 
-    if (m_shadowPass.enabled()) {
-        debug::LabelScope shadowLabel(cmd, "Shadow", {0.8f, 0.4f, 0.1f, 1.0f});
-        m_shadowPass.render(cmd, m_globalSets[m_currentFrame], shadowBatches);
-    }
+    // E1: Reset timestamp queries for this frame slot (must happen before execute()).
+    m_gpuTimestamps.reset(cmd, m_currentFrame);
 
-    // -- GPU compute cull pass (Phase 6) ---------------------------------------
-    // Build CullObject array (all alive objects, no CPU frustum test).
-    std::vector<CullBatch> cullBatches;
-    const uint32_t objectCount = m_world.buildCullData(
-        m_cullPass.objectData(m_currentFrame),
-        m_cullPass.objectCapacity(),
-        RenderLimits::kMaxBatches,
-        cullBatches,
-        m_camera.worldPosition());
+    prepareFrameData(); // CPU: build batch lists and flush per-frame GPU buffers
 
-    // Fill the indirect buffer: CPU sets static fields + instanceCount = 0.
-    // Compute shader atomicAdd-increments instanceCount for each visible object.
-    IndirectBuffer& indr = m_indirectBuffers[m_currentFrame];
-    for (const auto& b : cullBatches) {
-        auto& entry             = indr.data()[b.batchId];
-        entry.indexCount        = b.mesh->indexCount();
-        entry.instanceCount     = 0; // GPU compute fills this via atomicAdd
-        entry.firstIndex        = 0; // each Mesh owns a dedicated index buffer starting at 0
-        entry.vertexOffset      = 0; // no base-vertex offset (each Mesh has its own vertex buffer)
-        entry.firstInstance     = b.firstInstance;
-    }
-    indr.flush(static_cast<uint32_t>(cullBatches.size()));
+    // GPU: emit barriers, debug labels, timestamps, invoke pass callbacks.
+    m_renderGraph.execute(cmd, m_currentFrame, &m_gpuTimestamps);
 
-    // Barrier: HOST writes (instance SSBO from buildBatches + indirect + cull objects)
-    // must be visible to the compute shader before it reads / writes them.
-    // Also synchronizes: shadow VERTEX_SHADER reads -> COMPUTE writes on instance SSBO.
-    {
-        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        mb.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
-        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 1, &mb, 0, nullptr, 0, nullptr);
-    }
-
-    {
-        debug::LabelScope cullLabel(cmd, "GPU Cull", {0.5f, 0.9f, 0.5f, 1.0f});
-        const Frustum frustum = Frustum::fromVP(m_viewProj);
-        m_cullPass.dispatch(cmd, m_currentFrame, frustum.planes.data(), objectCount);
-    }
-
-    // Barrier: compute SHADER_WRITE (instance SSBO + indirect) must be visible
-    // before VERTEX_SHADER reads instances and DRAW_INDIRECT reads commands.
-    {
-        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
-            0, 1, &mb, 0, nullptr, 0, nullptr);
-    }
-
-    // -- HDR geometry pass: indirect draw (GPU-computed instance counts) -------
-    {
-        debug::LabelScope hdrLabel(cmd, "HDR Geometry", {0.2f, 0.6f, 0.9f, 1.0f});
-        m_postProcess.beginHdr(cmd, m_currentFrame);
-
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
-        // Bind global set (set 0: UBO + SSBO + shadow map + material SSBO).
-        // The instance SSBO at binding 1 now contains compute-written visible data.
-        // Set 1 (texture) is bound per-batch inside drawIndirect().
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                m_pipelineLayout, 0, 1,
-                                &m_globalSets[m_currentFrame], 0, nullptr);
-        m_world.drawIndirect(cmd, m_pipelineLayout, cullBatches, indr.handle());
-
-        m_postProcess.endHdr(cmd);
-    }
-
-    // -- Swapchain pass: tonemap blit + UI ------------------------------------
-    m_renderPass.begin(cmd, imageIndex);
-    {
-        debug::LabelScope blitLabel(cmd, "Post Blit", {0.6f, 0.9f, 0.2f, 1.0f});
-        m_postProcess.blit(cmd, m_currentFrame);
-    }
-    {
-        debug::LabelScope uiLabel(cmd, "UI", {0.9f, 0.6f, 0.2f, 1.0f});
-        m_imgui.newFrame();
-        renderUI();
-        m_imgui.render(cmd);
-    }
-    m_renderPass.end(cmd);
+    if (doCapture)
+        debug::endLabel(cmd);
 }
 
 void Application::renderUI() {
@@ -1085,6 +1983,35 @@ void Application::renderUI() {
     }
 
     ImGui::Separator();
+    ImGui::Text("IBL");
+    {
+        bool iblOn = m_cfg.iblEnabled;
+        if (ImGui::Checkbox("IBL Enabled", &iblOn))
+            m_cfg.iblEnabled = iblOn;
+        ImGui::Text("Baked Max Prefilter LoD: %d", m_iblBakedMaxPrefilterLod);
+        if (!m_cfg.iblPath.empty())
+            ImGui::TextDisabled("IBL probe LoD is fixed by the baked environment map.");
+    }
+
+    ImGui::Separator();
+    ImGui::Text("Sky");
+    {
+        const char* modeNames[] = {"None", "Color", "Skybox", "SkySphere"};
+        int modeIdx = static_cast<int>(m_skyPass.mode());
+        if (ImGui::Combo("Sky Mode", &modeIdx, modeNames, 4)) {
+            m_skyPass.setMode(static_cast<SkyMode>(modeIdx));
+            m_skyPass.requestRecapture();
+        }
+        if (m_skyPass.mode() != SkyMode::None && m_skyPass.mode() != SkyMode::Skybox) {
+            glm::vec3 skyCol = m_skyPass.skyColor();
+            if (ImGui::ColorEdit3("Sky Color", &skyCol.r)) {
+                m_skyPass.setSkyColor(skyCol);
+                m_skyPass.requestRecapture();
+            }
+        }
+    }
+
+    ImGui::Separator();
     ImGui::Text("Shadow");
     bool shadowOn = m_shadowPass.enabled();
     if (ImGui::Checkbox("Shadow maps", &shadowOn))
@@ -1139,6 +2066,257 @@ void Application::renderUI() {
         ImGui::PopID();
     }
 
+    ImGui::Separator();
+    ImGui::Text("Render Graph (B3 / E3)");
+    {
+        if (ImGui::Button("Print DAG to stdout"))
+            m_renderGraph.printOnNextExecute() = true;
+        ImGui::SameLine();
+        bool& trace = m_renderGraph.barrierTraceEnabled();
+        ImGui::Checkbox("Barrier trace (E2)", &trace);
+        ImGui::TextDisabled("Pass execution order:");
+        const uint32_t nPasses = m_renderGraph.passCount();
+        for (uint32_t i = 0; i < nPasses; ++i)
+            ImGui::BulletText("[%u] %s", i, m_renderGraph.passName(i));
+    }
+
+    // -- E1: Per-Pass GPU Timing -----------------------------------------------
+    ImGui::Separator();
+    ImGui::Text("GPU Pass Timings (E1)");
+    if (!m_gpuTimestamps.supported()) {
+        ImGui::TextDisabled("  (not supported on this device/queue)");
+    } else {
+        const uint32_t nResults = m_gpuTimestamps.resultPassCount();
+        if (nResults == 0) {
+            ImGui::TextDisabled("  (waiting for first results...)");
+        } else {
+            // Collect and sort to identify top-3 most expensive passes.
+            struct PassTiming { uint32_t idx; float avgMs; };
+            std::vector<PassTiming> sorted;
+            sorted.reserve(nResults);
+            float totalMs = 0.0f;
+            for (uint32_t i = 0; i < nResults; ++i) {
+                const float avg = m_gpuTimestamps.rollingAvgMs(i);
+                sorted.push_back({i, avg});
+                totalMs += avg;
+            }
+            std::sort(sorted.begin(), sorted.end(),
+                      [](const PassTiming& a, const PassTiming& b) {
+                          return a.avgMs > b.avgMs;
+                      });
+
+            ImGui::Text("  %-28s  %8s  %8s", "Pass", "Last ms", "Avg ms");
+            ImGui::Separator();
+            for (uint32_t ri = 0; ri < nResults; ++ri) {
+                const uint32_t i = sorted[ri].idx;
+                const float last = m_gpuTimestamps.lastMs(i);
+                const float avg  = m_gpuTimestamps.rollingAvgMs(i);
+                const bool top3  = ri < 3;
+                if (top3) ImGui::PushStyleColor(ImGuiCol_Text, {1.0f, 0.85f, 0.3f, 1.0f});
+                ImGui::Text("  %-28s  %7.3f   %7.3f",
+                            m_gpuTimestamps.passName(i), last, avg);
+                if (top3) ImGui::PopStyleColor();
+            }
+            ImGui::Separator();
+            ImGui::Text("  %-28s  %7.3f", "Total (sum of passes)", totalMs);
+        }
+    }
+
+    // -- E3: Debug Visualization Modes -----------------------------------------
+    ImGui::Separator();
+    ImGui::Text("Debug Visualization (E3)");
+    {
+        const char* vizNames[] = {"Off", "Cascade Index", "World Normal", "Roughness/Metallic"};
+        ImGui::Combo("Viz Mode", &m_debugVizMode, vizNames, 4);
+        if (m_debugVizMode == 1) {
+            ImGui::TextDisabled("  red=cascade0, green=cascade1, blue=cascade2, yellow=cascade3");
+            ImGui::TextDisabled("  Enable shadow maps to see cascade boundaries.");
+        } else if (m_debugVizMode == 2) {
+            ImGui::TextDisabled("  RGB = world normal * 0.5 + 0.5");
+        } else if (m_debugVizMode == 3) {
+            ImGui::TextDisabled("  R=metallic, G=roughness (PBR materials only)");
+        }
+        // Culling stats.
+        ImGui::Text("  Objects: %u  Batches: %u",
+                    m_currentObjectCount,
+                    static_cast<uint32_t>(m_currentCullBatches.size()));
+    }
+
+    // -- F3: Shader Hot Reload Status ------------------------------------------
+    ImGui::Separator();
+    ImGui::Text("Shader Hot Reload (F)");
+    {
+        using Status = ShaderWatcher::Status;
+        const Status   st     = m_shaderWatcher.status();
+        const bool     active = m_shaderWatcher.active();
+
+        if (!active) {
+            ImGui::TextDisabled("  Watcher inactive -- source dir not found.");
+            ImGui::TextDisabled("  Set VKT_SHADER_SOURCE_DIR to the shaders/ directory.");
+        } else {
+            const char* statusStr[] = {"Idle", "Watching", "Compiling", "Ready", "Failed"};
+            const int   statusIdx   = static_cast<int>(st);
+            if (st == Status::Compiling)
+                ImGui::TextColored({1.0f, 0.9f, 0.3f, 1.0f}, "  Status: %s", statusStr[statusIdx]);
+            else if (st == Status::Failed)
+                ImGui::TextColored({1.0f, 0.3f, 0.3f, 1.0f}, "  Status: %s", statusStr[statusIdx]);
+            else if (st == Status::Ready)
+                ImGui::TextColored({0.3f, 1.0f, 0.4f, 1.0f}, "  Status: %s", statusStr[statusIdx]);
+            else
+                ImGui::TextDisabled("  Status: %s", statusStr[statusIdx]);
+
+            const auto result = m_shaderWatcher.lastResult();
+            if (!result.timestamp.empty()) {
+                if (result.success)
+                    ImGui::Text("  Last compile: %s  [OK]", result.timestamp.c_str());
+                else
+                    ImGui::TextColored({1.0f, 0.4f, 0.4f, 1.0f},
+                                       "  Last compile: %s  [FAILED]", result.timestamp.c_str());
+            }
+
+            ImGui::TextDisabled("  Watching:");
+            for (const auto& name : m_shaderWatcher.watchedNames())
+                ImGui::BulletText("%s", name.c_str());
+
+            if (ImGui::Button("Recompile Now"))
+                m_shaderWatcher.requestRecompile();
+
+            // Error log -- shown only on failure so it doesn't clutter normal use.
+            if (st == Status::Failed && !result.errors.empty()) {
+                ImGui::Separator();
+                ImGui::TextColored({1.0f, 0.4f, 0.4f, 1.0f}, "  Compile errors:");
+                ImGui::BeginChild("shader_errors", {0.0f, 120.0f}, true);
+                ImGui::TextUnformatted(result.errors.c_str());
+                ImGui::EndChild();
+            }
+        }
+    }
+
+    // -- G3: Bindless Textures (G) ---------------------------------------------
+    ImGui::Separator();
+    ImGui::Text("Bindless Textures (G)");
+    {
+        if (!m_bindlessSupported) {
+            ImGui::TextColored({0.8f, 0.8f, 0.4f, 1.0f},
+                               "  Not supported on this GPU (per-bind fallback)");
+        } else {
+            ImGui::Text("  Textures registered: %u / %u",
+                        m_bindlessSet.count(), RenderLimits::kMaxBindlessTextures);
+            ImGui::Checkbox("Enable Bindless Path (G3)", &m_useBindless);
+            if (!m_useBindless)
+                ImGui::TextDisabled("  Using per-batch descriptor set binds (fallback)");
+        }
+    }
+
+    // -- E4: Capture Integration -----------------------------------------------
+    ImGui::Separator();
+    ImGui::Text("Capture (E4)");
+    {
+        ImGui::TextDisabled("F11 or button below wraps the next frame in a");
+        ImGui::TextDisabled("\"CAPTURE_FRAME\" debug label for RenderDoc.");
+        if (ImGui::Button("Mark Next Frame (F11)"))
+            m_captureNextFrame = true;
+        ImGui::SameLine();
+        if (m_captureNextFrame)
+            ImGui::TextColored({1.0f, 0.5f, 0.0f, 1.0f}, "PENDING");
+        else
+            ImGui::TextDisabled("idle");
+    }
+
+    ImGui::Separator();
+    ImGui::Text("Async Streaming (C4)");
+    {
+        const auto c = m_streamLoader.counters();
+        ImGui::Text("  Queued:    %u", c.queued);
+        ImGui::Text("  Loading:   %u", c.loading);
+        ImGui::Text("  Uploading: %u", c.uploading);
+        ImGui::Text("  Completed: %u", c.completed);
+        ImGui::Text("  Failed:    %u", c.failed);
+        ImGui::Text("  Cancelled: %u", c.cancelled);
+
+        // Demo: stream the IBL path on demand so the path can be exercised
+        // without modifying scene files. The request is fire-and-forget;
+        // the caller-side hot-swap pattern (write descriptor when Ready) is
+        // shown as a comment because it depends on the material pipeline.
+        if (!m_cfg.iblPath.empty()) {
+            if (ImGui::Button("Stream Test: reload IBL texture")) {
+                StreamHandle h = m_streamLoader.request(
+                    m_cfg.iblPath, StreamLoader::ColorSpace::Linear);
+                if (h == kInvalidStream)
+                    ImGui::OpenPopup("stream_full");
+                // When status(h) == StreamStatus::Ready, call result(h) to
+                // get the final VkImageView + VkSampler and write the
+                // descriptor (e.g. via DescriptorWriter::update).
+            }
+            if (ImGui::BeginPopup("stream_full")) {
+                ImGui::Text("Stream queue full -- try again next frame.");
+                ImGui::EndPopup();
+            }
+        }
+    }
+
+    // -- I1: GPU Crash Resiliency Status --------------------------------------
+    ImGui::Separator();
+    ImGui::Text("GPU Crash Resiliency (I)");
+    {
+        if (m_deviceLost) {
+            ImGui::TextColored({1.0f, 0.2f, 0.2f, 1.0f}, "  DEVICE LOST");
+            ImGui::Text("  Frame : %llu", static_cast<unsigned long long>(m_deviceLostInfo.frame));
+            ImGui::Text("  Stage : %s",  m_deviceLostInfo.stage.c_str());
+            ImGui::TextWrapped("  Passes: %s", m_deviceLostInfo.passNames.c_str());
+            ImGui::TextDisabled("  Diagnostic logged to stderr. Close and restart.");
+        } else {
+            ImGui::TextColored({0.3f, 1.0f, 0.4f, 1.0f}, "  OK");
+            ImGui::TextDisabled("  Monitoring: WaitForFences / AcquireNextImage /");
+            ImGui::TextDisabled("              QueueSubmit / QueuePresent");
+        }
+    }
+
+    // -- H1: Memory Budget Dashboard ------------------------------------------
+    ImGui::Separator();
+    ImGui::Text("Memory Budget (H)");
+    {
+        VmaBudget budgets[VK_MAX_MEMORY_HEAPS]{};
+        vmaGetHeapBudgets(m_allocator.handle(), budgets);
+
+        ImGui::Text("  %-6s  %-10s  %-10s  %-10s  %s",
+                    "Heap", "Used (MB)", "Peak (MB)", "Budget (MB)", "Usage");
+        ImGui::Separator();
+        for (uint32_t i = 0; i < m_heapCount; ++i) {
+            const VkDeviceSize used   = budgets[i].statistics.blockBytes;
+            const VkDeviceSize budget = budgets[i].budget;
+
+            // Update session peak.
+            if (used > m_heapPeaks[i])
+                m_heapPeaks[i] = used;
+
+            const float usedMB   = static_cast<float>(used)          / (1024.0f * 1024.0f);
+            const float peakMB   = static_cast<float>(m_heapPeaks[i])/ (1024.0f * 1024.0f);
+            const float budgetMB = static_cast<float>(budget)        / (1024.0f * 1024.0f);
+            const float fraction = (budget > 0)
+                                   ? static_cast<float>(used) / static_cast<float>(budget)
+                                   : 0.0f;
+
+            // Colour the bar: green < 70%, yellow < 90%, red >= 90%.
+            ImVec4 barCol = (fraction < 0.7f) ? ImVec4{0.2f, 0.8f, 0.3f, 1.0f}
+                          : (fraction < 0.9f) ? ImVec4{0.9f, 0.8f, 0.1f, 1.0f}
+                                              : ImVec4{0.9f, 0.2f, 0.2f, 1.0f};
+
+            ImGui::PushID(static_cast<int>(i));
+            ImGui::Text("  H%-5u  %10.2f  %10.2f  %10.2f",
+                        i, usedMB, peakMB, budgetMB);
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, barCol);
+            char overlay[32];
+            snprintf(overlay, sizeof(overlay), "%.1f%%", fraction * 100.0f);
+            ImGui::ProgressBar(fraction, {-1.0f, 0.0f}, overlay);
+            ImGui::PopStyleColor();
+            ImGui::PopID();
+        }
+        if (ImGui::Button("Reset Peaks"))
+            for (uint32_t i = 0; i < m_heapCount; ++i)
+                m_heapPeaks[i] = 0;
+    }
+
     ImGui::End();
 }
 
@@ -1170,6 +2348,7 @@ void Application::handleResize() {
 
     m_imgui.onSwapchainRebuilt(m_swapchain.imageCount());
     m_camera.setAspect(static_cast<float>(w) / static_cast<float>(h));
+    createRenderGraph();
 }
 
 // -- Input ----------------------------------------------------------------------
@@ -1186,6 +2365,12 @@ void Application::processInput(float dt) {
             m_camera.projectionMode() == PM::Perspective ? PM::Orthographic : PM::Perspective);
     }
     m_oPrevPressed = oNow;
+
+    // F11 key: trigger a "CAPTURE_FRAME" debug label for RenderDoc one-click capture (E4).
+    const bool captureNow = glfwGetKey(m_window, GLFW_KEY_F11) == GLFW_PRESS;
+    if (captureNow && !m_captureKeyPrev)
+        m_captureNextFrame = true;
+    m_captureKeyPrev = captureNow;
 
     if (glfwGetMouseButton(m_window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS && !m_mouseCapture) {
         m_mouseCapture = true;
@@ -1248,12 +2433,49 @@ void Application::onWindowScale(GLFWwindow* window, float xscale, float) {
     app->m_imgui.onDpiChange(xscale);
 }
 
+// -- Track I: GPU Crash Resiliency ----------------------------------------------
+
+void Application::reportDeviceLost(VkResult result, const char* stage) {
+    if (m_deviceLost) return; // report only the first occurrence
+
+    m_deviceLost = true;
+
+    // Collect active render pass names for context.
+    std::string passNames;
+    const uint32_t nPasses = m_renderGraph.passCount();
+    for (uint32_t i = 0; i < nPasses; ++i) {
+        if (i > 0) passNames += "; ";
+        passNames += m_renderGraph.passName(i);
+    }
+    if (passNames.empty()) passNames = "(no passes registered)";
+
+    m_deviceLostInfo.frame     = m_frameCount;
+    m_deviceLostInfo.stage     = stage ? stage : "(unknown)";
+    m_deviceLostInfo.passNames = passNames;
+
+    std::fprintf(stderr,
+        "[App] VK_ERROR_DEVICE_LOST -- result=0x%08X\n"
+        "  Stage      : %s\n"
+        "  Frame      : %llu\n"
+        "  RG passes  : %s\n"
+        "  Action     : beginning graceful shutdown (no device recreation).\n",
+        static_cast<unsigned>(result),
+        m_deviceLostInfo.stage.c_str(),
+        static_cast<unsigned long long>(m_deviceLostInfo.frame),
+        m_deviceLostInfo.passNames.c_str());
+    std::fflush(stderr);
+}
+
 // -- Shutdown -------------------------------------------------------------------
 
 void Application::shutdown() {
     if (!m_window) return;
 
-    if (vkDeviceWaitIdle(m_ctx.device()) != VK_SUCCESS) {
+    // I1: Skip vkDeviceWaitIdle on a lost device -- it will fail or hang.
+    // All Vulkan destroy calls below are still valid on a lost device (per spec).
+    if (m_deviceLost) {
+        std::fprintf(stderr, "[App] shutdown: device is lost -- skipping vkDeviceWaitIdle\n");
+    } else if (vkDeviceWaitIdle(m_ctx.device()) != VK_SUCCESS) {
         // shutdown() can be reached from the destructor; avoid throwing here.
         std::fprintf(stderr, "[App] Warning: vkDeviceWaitIdle failed during shutdown\n");
     }
@@ -1271,11 +2493,28 @@ void Application::shutdown() {
         vkDestroyFence(m_ctx.device(), f.inFlightFence, nullptr);
     }
 
-    // Destroy shadow + post-process + cull passes before the pipeline and allocator.
+    // Destroy async streaming before any GPU resources are freed.
+    // destroy() waits for any in-flight upload fences before releasing Images.
+    m_streamLoader.destroy();
+
+    // F1: Stop the shader watcher thread before Vulkan objects are destroyed.
+    m_shaderWatcher.destroy();
+
+    // F2: Destroy any deferred pipelines that are still pending.
+    for (auto& dp : m_deferredPipelineDestroys)
+        if (dp.pipeline != VK_NULL_HANDLE)
+            vkDestroyPipeline(m_ctx.device(), dp.pipeline, nullptr);
+    m_deferredPipelineDestroys.clear();
+
+    // E1: Destroy GPU timestamp query pools.
+    m_gpuTimestamps.destroy();
+
+    // Destroy shadow + post-process + cull + sky passes before the pipeline and allocator.
     m_shadowPass.destroy();
     m_postProcess.destroy();
     m_cullPass.destroy();
     for (auto& ib : m_indirectBuffers) ib.destroy();
+    m_skyPass.destroy();
 
     // Destroy material SSBO before the allocator.
     m_materials.destroy();
@@ -1289,6 +2528,18 @@ void Application::shutdown() {
     // Destroy file-loaded textures (Image GPU resources) before the allocator.
     m_sceneTextures.clear();
 
+    // Destroy IBL resources before the allocator.
+    m_iblBrdfLut.destroy();
+    m_iblPrefilter.destroy();
+    m_iblIrradiance.destroy();
+    m_iblEnvCubemap.destroy();
+    m_iblLutSampler.destroy();
+    m_iblCubeSampler.destroy();
+
+    // Destroy default normal image + sampler.
+    m_defaultNormalSampler.destroy();
+    m_defaultNormalImage.destroy();
+
     m_defaultSampler.destroy();
     m_defaultImage.destroy();
     for (auto& ub : m_uniformBuffers) ub.destroy();
@@ -1298,6 +2549,17 @@ void Application::shutdown() {
     vkDestroyDescriptorSetLayout(m_ctx.device(), m_materialLayout, nullptr);
     vkDestroyPipeline(m_ctx.device(), m_pipeline, nullptr);
     vkDestroyPipelineLayout(m_ctx.device(), m_pipelineLayout, nullptr);
+
+    // G1/G2: Destroy bindless resources.
+    if (m_bindlessPipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(m_ctx.device(), m_bindlessPipeline, nullptr);
+        m_bindlessPipeline = VK_NULL_HANDLE;
+    }
+    if (m_bindlessPipelineLayout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(m_ctx.device(), m_bindlessPipelineLayout, nullptr);
+        m_bindlessPipelineLayout = VK_NULL_HANDLE;
+    }
+    m_bindlessSet.destroy();
 
     if (m_pipelineCache != VK_NULL_HANDLE) {
         vkDestroyPipelineCache(m_ctx.device(), m_pipelineCache, nullptr);

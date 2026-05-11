@@ -47,6 +47,7 @@ public:
     VkImageView depthImageView() const { return m_depthImageView; }
 
     // MSAA color resolve image (VK_NULL_HANDLE when MSAA is disabled)
+    VkImage               msaaImage()     const { return m_msaaImage; }
     VkImageView           msaaImageView() const { return m_msaaImageView; }
     VkSampleCountFlagBits msaaSamples()   const { return m_msaaSamples; }
     bool                  isMsaaEnabled() const { return m_msaaSamples > VK_SAMPLE_COUNT_1_BIT; }

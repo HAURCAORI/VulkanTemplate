@@ -20,6 +20,12 @@ set(SHADER_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/fullscreen.vert
     ${CMAKE_CURRENT_SOURCE_DIR}/post_basic.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/cull.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/skybox.vert
+    ${CMAKE_CURRENT_SOURCE_DIR}/skybox.frag
+    ${CMAKE_CURRENT_SOURCE_DIR}/default_bindless.frag
+    ${CMAKE_CURRENT_SOURCE_DIR}/equirect_to_cube.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/irradiance_conv.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/prefilter_env.comp
 )
 
 set(SHADER_OUTPUTS)

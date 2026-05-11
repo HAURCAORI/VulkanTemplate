@@ -135,6 +135,17 @@ TEST_CASE("RenderWorld -- alive() is false for out-of-range id") {
     world.destroy();
 }
 
+TEST_CASE("RenderWorld -- materialId is stored on spawn and can be updated") {
+    WorldFixture f;
+    f.world.registerTexture("default", fakeSet(99));
+    const vkt::ObjectId id = f.world.spawn(f.mh, f.th, glm::mat4{1.0f}, true, 7);
+    CHECK(id != vkt::INVALID_HANDLE);
+    CHECK(f.world.getMaterialId(id) == 7u);
+
+    f.world.setMaterialId(id, 11);
+    CHECK(f.world.getMaterialId(id) == 11u);
+}
+
 // -- Transform & world position ----------------------------------------------
 
 TEST_CASE("RenderWorld -- setWorldPosition / getWorldPosition roundtrip") {

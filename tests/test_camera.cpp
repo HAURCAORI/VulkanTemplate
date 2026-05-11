@@ -102,8 +102,9 @@ TEST_CASE("Camera -- forward() and right() are unit vectors") {
 
 TEST_CASE("Camera -- pitch is clamped to +/-89 deg") {
     vkt::Camera cam;
+    cam.setPerspective(60.0f, 1.0f, 0.1f, 1000.0f); // establish a valid projection
     cam.setPitch(200.0f);
-    CHECK(cam.projectionMatrix()[1][1] < 0.0f); // still valid projection
+    CHECK(cam.projectionMatrix()[1][1] < 0.0f); // still valid projection (Y-flipped for Vulkan)
     // No crash -- clamping doesn't produce NaN in viewMatrix
     const glm::mat4 v = cam.viewMatrix();
     for (int c = 0; c < 4; ++c)

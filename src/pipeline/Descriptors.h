@@ -50,6 +50,8 @@ public:
     // Reset all allocations (reuse pool memory without reallocation)
     void resetPool();
 
+    VkDescriptorPool handle() const { return m_pool; }
+
 private:
     VkDevice         m_device = VK_NULL_HANDLE;
     VkDescriptorPool m_pool   = VK_NULL_HANDLE;

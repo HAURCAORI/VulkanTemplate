@@ -7,6 +7,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <cstdio>
+#include <unordered_map>
 
 namespace vkt {
 
@@ -52,6 +53,18 @@ glm::vec3 readVec3(const json& obj, const char* key,
     return {v[0].get<float>(), v[1].get<float>(), v[2].get<float>()};
 }
 
+glm::vec4 readVec4(const json& obj, const char* key,
+                  glm::vec4 def = {1.0f, 1.0f, 1.0f, 1.0f}) {
+    if (!obj.contains(key)) return def;
+    const auto& v = obj[key];
+    if (!v.is_array() || v.size() != 4 ||
+        !v[0].is_number() || !v[1].is_number() || !v[2].is_number() || !v[3].is_number()) {
+        throw std::runtime_error(std::string("[SceneLoader] '") + key +
+                                 "' must be [x,y,z,w] numbers");
+    }
+    return {v[0].get<float>(), v[1].get<float>(), v[2].get<float>(), v[3].get<float>()};
+}
+
 glm::vec3 readScale(const json& obj) {
     if (!obj.contains("scale")) return {1.0f, 1.0f, 1.0f};
     const auto& s = obj["scale"];
@@ -79,6 +92,16 @@ glm::mat4 buildTransform(const json& j) {
     return t;
 }
 
+Texture::ColorSpace readColorSpace(const json& obj, const char* where) {
+    const std::string colorSpace = obj.value("colorSpace", "srgb");
+    if (colorSpace == "srgb" || colorSpace == "sRGB")
+        return Texture::ColorSpace::Srgb;
+    if (colorSpace == "linear")
+        return Texture::ColorSpace::Linear;
+    throw std::runtime_error("[SceneLoader] Unsupported colorSpace '" + colorSpace +
+                             "' in " + where);
+}
+
 } // namespace
 
 void SceneLoader::load(const SceneLoadContext&                ctx,
@@ -96,6 +119,86 @@ void SceneLoader::load(const SceneLoadContext&                ctx,
 
     // allow_exceptions=true (default), ignore_comments=true for // and /* */
     const json j = json::parse(file, nullptr, true, true);
+
+    struct TextureBinding {
+        VkImageView   view        = VK_NULL_HANDLE;
+        VkSampler     sampler     = VK_NULL_HANDLE;
+        TextureHandle handle      = INVALID_HANDLE;
+        uint32_t      bindlessIdx = 0;  // index into bindlessSet array (Track G)
+    };
+
+    struct MaterialBinding {
+        uint32_t      materialId    = MaterialManager::kDefaultId;
+        TextureHandle textureHandle = INVALID_HANDLE;
+        std::string   albedoName    = "default";
+        std::string   normalName    = "default_normal";
+    };
+
+    std::unordered_map<std::string, TextureBinding> texturesByName;
+    std::unordered_map<std::string, TextureHandle> materialTexturePairs;
+    std::unordered_map<std::string, MaterialBinding> materialsByName;
+
+    if (ctx.defaultAlbedoView != VK_NULL_HANDLE && ctx.defaultAlbedoSampler != VK_NULL_HANDLE) {
+        TextureBinding binding;
+        binding.view        = ctx.defaultAlbedoView;
+        binding.sampler     = ctx.defaultAlbedoSampler;
+        binding.handle      = world.findTexture("default");
+        binding.bindlessIdx = ctx.defaultAlbedoBindlessIdx;
+        texturesByName.emplace("default", binding);
+    }
+
+    auto resolveTextureBinding =
+        [&](const std::string& name, bool allowMissingDefault, const char* where) -> TextureBinding {
+            if (name.empty()) {
+                return allowMissingDefault ? TextureBinding{} : texturesByName.at("default");
+            }
+            if (auto it = texturesByName.find(name); it != texturesByName.end())
+                return it->second;
+            if (allowMissingDefault)
+                return {};
+            throw std::runtime_error("[SceneLoader] Unknown texture '" + name + "' in " + where);
+        };
+
+    auto resolveMaterialTexture =
+        [&](const std::string& materialName,
+            const TextureBinding& albedo,
+            const TextureBinding& normal,
+            const std::string& albedoName,
+            const std::string& normalName) -> TextureHandle {
+            if (albedo.handle == INVALID_HANDLE) {
+                throw std::runtime_error("[SceneLoader] Material '" + materialName +
+                                         "' has no valid albedo texture binding");
+            }
+
+            const bool usesDefaultPair =
+                albedo.handle == world.findTexture("default") &&
+                (normal.view == VK_NULL_HANDLE || normal.view == ctx.defaultNormalView);
+            if (usesDefaultPair)
+                return albedo.handle;
+
+            const std::string pairKey = albedoName + "|" + normalName;
+            if (auto it = materialTexturePairs.find(pairKey); it != materialTexturePairs.end())
+                return it->second;
+
+            if (!ctx.descriptorPool || ctx.materialLayout == VK_NULL_HANDLE)
+                throw std::runtime_error("[SceneLoader] Material texture pair requires descriptor context");
+
+            const VkDescriptorSet set = ctx.descriptorPool->allocate(ctx.materialLayout);
+            DescriptorWriter writer;
+            writer.writeImage(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                              albedo.view, albedo.sampler,
+                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            writer.writeImage(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                              normal.view != VK_NULL_HANDLE ? normal.view : ctx.defaultNormalView,
+                              normal.sampler != VK_NULL_HANDLE ? normal.sampler : ctx.defaultNormalSampler,
+                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            writer.update(ctx.device, set);
+
+            const std::string worldName = "__material_pair__" + materialName;
+            const TextureHandle handle = world.registerTexture(worldName, set);
+            materialTexturePairs.emplace(pairKey, handle);
+            return handle;
+        };
 
     // -- Meshes ----------------------------------------------------------------
     if (j.contains("meshes")) {
@@ -157,19 +260,103 @@ void SceneLoader::load(const SceneLoadContext&                ctx,
 
             auto tex = std::make_unique<Texture>();
             Buffer stg;
+            const auto colorSpace = readColorSpace(t, where.c_str());
             tex->loadFromFile(ctx.allocator, ctx.device, ctx.physDevice,
-                              ctx.uploadCmd, stg, texPath);
+                              ctx.uploadCmd, stg, texPath, colorSpace);
             outStaging.push_back(std::move(stg));
 
             const VkDescriptorSet set = ctx.descriptorPool->allocate(ctx.materialLayout);
-            DescriptorWriter{}
-                .writeImage(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                            tex->view(), tex->sampler(),
-                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-                .update(ctx.device, set);
+            {
+                DescriptorWriter writer;
+                writer.writeImage(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                  tex->view(), tex->sampler(),
+                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                if (ctx.defaultNormalView != VK_NULL_HANDLE) {
+                    writer.writeImage(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                      ctx.defaultNormalView, ctx.defaultNormalSampler,
+                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                }
+                writer.update(ctx.device, set);
+            }
 
-            world.registerTexture(name, set);
+            const TextureHandle handle = world.registerTexture(name, set);
+            TextureBinding binding;
+            binding.view    = tex->view();
+            binding.sampler = tex->sampler();
+            binding.handle  = handle;
+            // G2: register into bindless array if available.
+            if (ctx.bindlessSet) {
+                binding.bindlessIdx =
+                    ctx.bindlessSet->registerTexture(ctx.device, tex->view(), tex->sampler());
+            }
+            texturesByName.emplace(name, binding);
             outTextures.push_back(std::move(tex));
+        }
+    }
+
+    // -- Materials -------------------------------------------------------------
+    if (j.contains("materials")) {
+        if (!j["materials"].is_array())
+            throw std::runtime_error("[SceneLoader] 'materials' must be an array");
+        if (!ctx.materials)
+            throw std::runtime_error("[SceneLoader] MaterialManager context is required for 'materials'");
+
+        for (size_t i = 0; i < j["materials"].size(); ++i) {
+            const auto& m = j["materials"][i];
+            if (!m.is_object())
+                throw std::runtime_error("[SceneLoader] material entry must be an object");
+
+            const std::string where = "materials[" + std::to_string(i) + "]";
+            const std::string name = requireString(m, "name", where.c_str());
+
+            GPUMaterial gpuMat{};
+            gpuMat.baseColor = readVec4(m, "baseColor", gpuMat.baseColor);
+            gpuMat.roughness = m.value("roughness", gpuMat.roughness);
+            gpuMat.metallic  = m.value("metallic",  gpuMat.metallic);
+            gpuMat.emissive  = m.value("emissive",  gpuMat.emissive);
+
+            if (m.value("unlit", false))     gpuMat.flags |= MaterialFlags::Unlit;
+            if (m.value("alphaTest", false)) gpuMat.flags |= MaterialFlags::AlphaTest;
+            if (m.value("usePBR", false))    gpuMat.flags |= MaterialFlags::UsePBR;
+
+            std::string albedoName = m.value("albedoTexture", m.value("texture", std::string("default")));
+            std::string normalName = m.value("normalTexture", std::string{});
+
+            const TextureBinding albedo = resolveTextureBinding(albedoName, false, where.c_str());
+            TextureBinding normal;
+            if (!normalName.empty()) {
+                normal = resolveTextureBinding(normalName, true, where.c_str());
+                if (normal.view == VK_NULL_HANDLE) {
+                    throw std::runtime_error("[SceneLoader] Unknown normal texture '" + normalName +
+                                             "' in " + where);
+                }
+                gpuMat.flags |= MaterialFlags::HasNormalMap;
+            } else {
+                normalName = "default_normal";
+                normal.view = ctx.defaultNormalView;
+                normal.sampler = ctx.defaultNormalSampler;
+            }
+
+            const TextureHandle materialTexHandle =
+                resolveMaterialTexture(name, albedo, normal, albedoName, normalName);
+
+            // G2: write bindless texture indices if bindless set is available.
+            if (ctx.bindlessSet) {
+                gpuMat.albedoTexIdx = albedo.bindlessIdx;
+                // Use the normal texture's bindless index if it was loaded from file.
+                // Fall back to the default normal index otherwise.
+                const bool useDefaultNormal =
+                    (normal.view == VK_NULL_HANDLE || normal.view == ctx.defaultNormalView);
+                gpuMat.normalTexIdx =
+                    useDefaultNormal ? ctx.defaultNormalBindlessIdx : normal.bindlessIdx;
+            }
+
+            MaterialBinding binding;
+            binding.materialId    = ctx.materials->add(name, gpuMat);
+            binding.textureHandle = materialTexHandle;
+            binding.albedoName    = albedoName;
+            binding.normalName    = normalName;
+            materialsByName[name] = binding;
         }
     }
 
@@ -185,10 +372,23 @@ void SceneLoader::load(const SceneLoadContext&                ctx,
 
             const std::string meshName = o.value("mesh", "");
             const std::string texName  = o.value("texture", "default");
+            const std::string materialName = o.value("material", "");
 
             const MeshHandle mh = world.findMesh(meshName);
             TextureHandle    th = world.findTexture(texName);
             if (th == INVALID_HANDLE) th = world.findTexture("default");
+            uint32_t         materialId = MaterialManager::kDefaultId;
+
+            if (!materialName.empty()) {
+                const auto it = materialsByName.find(materialName);
+                if (it == materialsByName.end()) {
+                    std::fprintf(stderr, "[SceneLoader] Unknown material '%s', using defaults\n",
+                                 materialName.c_str());
+                } else {
+                    materialId = it->second.materialId;
+                    th         = it->second.textureHandle;
+                }
+            }
 
             if (mh == INVALID_HANDLE) {
                 std::fprintf(stderr, "[SceneLoader] Unknown mesh '%s', skipping\n",
@@ -200,7 +400,7 @@ void SceneLoader::load(const SceneLoadContext&                ctx,
             const float     boundRadius = o.value("boundRadius", 0.0f);
             const glm::vec3 boundCenter = readVec3(o, "boundCenter");
 
-            const ObjectId id = world.spawn(mh, th, buildTransform(o), rigidBody);
+            const ObjectId id = world.spawn(mh, th, buildTransform(o), rigidBody, materialId);
             if (id == INVALID_HANDLE) {
                 std::fprintf(stderr, "[SceneLoader] Failed to spawn object at index %zu, skipping\n", i);
                 continue;

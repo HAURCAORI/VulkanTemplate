@@ -1,6 +1,7 @@
 #include "Image.h"
 
 #include <stdexcept>
+#include <vector>
 
 namespace vkt {
 
@@ -9,26 +10,28 @@ namespace vkt {
 Image::Image(Image&& o) noexcept
     : m_allocator(VK_NULL_HANDLE), m_device(VK_NULL_HANDLE), m_image(VK_NULL_HANDLE),
       m_view(VK_NULL_HANDLE), m_allocation(VK_NULL_HANDLE), m_format(VK_FORMAT_UNDEFINED),
-      m_width(0), m_height(0), m_mipLevels(1)
+      m_width(0), m_height(0), m_mipLevels(1), m_arrayLayers(1)
 {
     std::scoped_lock lock(m_mutex, o.m_mutex);
-    m_allocator  = o.m_allocator;
-    m_device     = o.m_device;
-    m_image      = o.m_image;
-    m_view       = o.m_view;
-    m_allocation = o.m_allocation;
-    m_format     = o.m_format;
-    m_width      = o.m_width;
-    m_height     = o.m_height;
-    m_mipLevels  = o.m_mipLevels;
-    o.m_image      = VK_NULL_HANDLE;
-    o.m_view       = VK_NULL_HANDLE;
-    o.m_allocation = VK_NULL_HANDLE;
-    o.m_allocator  = VK_NULL_HANDLE;
-    o.m_device     = VK_NULL_HANDLE;
-    o.m_width      = 0;
-    o.m_height     = 0;
-    o.m_mipLevels  = 1;
+    m_allocator   = o.m_allocator;
+    m_device      = o.m_device;
+    m_image       = o.m_image;
+    m_view        = o.m_view;
+    m_allocation  = o.m_allocation;
+    m_format      = o.m_format;
+    m_width       = o.m_width;
+    m_height      = o.m_height;
+    m_mipLevels   = o.m_mipLevels;
+    m_arrayLayers = o.m_arrayLayers;
+    o.m_image       = VK_NULL_HANDLE;
+    o.m_view        = VK_NULL_HANDLE;
+    o.m_allocation  = VK_NULL_HANDLE;
+    o.m_allocator   = VK_NULL_HANDLE;
+    o.m_device      = VK_NULL_HANDLE;
+    o.m_width       = 0;
+    o.m_height      = 0;
+    o.m_mipLevels   = 1;
+    o.m_arrayLayers = 1;
 }
 
 Image& Image::operator=(Image&& o) noexcept {
@@ -43,23 +46,25 @@ Image& Image::operator=(Image&& o) noexcept {
             m_image      = VK_NULL_HANDLE;
             m_allocation = VK_NULL_HANDLE;
         }
-        m_allocator  = o.m_allocator;
-        m_device     = o.m_device;
-        m_image      = o.m_image;
-        m_view       = o.m_view;
-        m_allocation = o.m_allocation;
-        m_format     = o.m_format;
-        m_width      = o.m_width;
-        m_height     = o.m_height;
-        m_mipLevels  = o.m_mipLevels;
-        o.m_image      = VK_NULL_HANDLE;
-        o.m_view       = VK_NULL_HANDLE;
-        o.m_allocation = VK_NULL_HANDLE;
-        o.m_allocator  = VK_NULL_HANDLE;
-        o.m_device     = VK_NULL_HANDLE;
-        o.m_width      = 0;
-        o.m_height     = 0;
-        o.m_mipLevels  = 1;
+        m_allocator   = o.m_allocator;
+        m_device      = o.m_device;
+        m_image       = o.m_image;
+        m_view        = o.m_view;
+        m_allocation  = o.m_allocation;
+        m_format      = o.m_format;
+        m_width       = o.m_width;
+        m_height      = o.m_height;
+        m_mipLevels   = o.m_mipLevels;
+        m_arrayLayers = o.m_arrayLayers;
+        o.m_image       = VK_NULL_HANDLE;
+        o.m_view        = VK_NULL_HANDLE;
+        o.m_allocation  = VK_NULL_HANDLE;
+        o.m_allocator   = VK_NULL_HANDLE;
+        o.m_device      = VK_NULL_HANDLE;
+        o.m_width       = 0;
+        o.m_height      = 0;
+        o.m_mipLevels   = 1;
+        o.m_arrayLayers = 1;
     }
     return *this;
 }
@@ -68,20 +73,22 @@ Image& Image::operator=(Image&& o) noexcept {
 
 void Image::create(VmaAllocator allocator, VkDevice device, const CreateInfo& info) {
     std::scoped_lock lock(m_mutex);
-    m_allocator = allocator;
-    m_device    = device;
-    m_format    = info.format;
-    m_width     = info.width;
-    m_height    = info.height;
-    m_mipLevels = info.mipLevels;
+    m_allocator   = allocator;
+    m_device      = device;
+    m_format      = info.format;
+    m_width       = info.width;
+    m_height      = info.height;
+    m_mipLevels   = info.mipLevels;
+    m_arrayLayers = info.arrayLayers;
 
     VkImageCreateInfo imageInfo{};
     imageInfo.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.flags         = info.createFlags;
     imageInfo.imageType     = VK_IMAGE_TYPE_2D;
     imageInfo.format        = info.format;
     imageInfo.extent        = {info.width, info.height, 1};
     imageInfo.mipLevels     = info.mipLevels;
-    imageInfo.arrayLayers   = 1;
+    imageInfo.arrayLayers   = info.arrayLayers;
     imageInfo.samples       = info.samples;
     imageInfo.tiling        = VK_IMAGE_TILING_OPTIMAL;
     imageInfo.usage         = info.usage;
@@ -94,16 +101,21 @@ void Image::create(VmaAllocator allocator, VkDevice device, const CreateInfo& in
     if (vmaCreateImage(allocator, &imageInfo, &allocInfo, &m_image, &m_allocation, nullptr) != VK_SUCCESS)
         throw std::runtime_error("[Image] Failed to create image");
 
+    // Choose view type: cubemap if 6 layers with CUBE_COMPATIBLE flag, otherwise 2D.
+    const bool isCube = (info.arrayLayers == 6) &&
+                        ((info.createFlags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) != 0);
+
     VkImageViewCreateInfo viewInfo{};
     viewInfo.sType                           = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     viewInfo.image                           = m_image;
-    viewInfo.viewType                        = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.viewType                        = isCube ? VK_IMAGE_VIEW_TYPE_CUBE
+                                                      : VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.format                          = info.format;
     viewInfo.subresourceRange.aspectMask     = info.aspect;
     viewInfo.subresourceRange.baseMipLevel   = 0;
     viewInfo.subresourceRange.levelCount     = info.mipLevels;
     viewInfo.subresourceRange.baseArrayLayer = 0;
-    viewInfo.subresourceRange.layerCount     = 1;
+    viewInfo.subresourceRange.layerCount     = info.arrayLayers;
 
     if (vkCreateImageView(device, &viewInfo, nullptr, &m_view) != VK_SUCCESS)
         throw std::runtime_error("[Image] Failed to create image view");
@@ -128,7 +140,8 @@ Image::~Image() { destroy(); }
 
 void Image::transitionLayout(VkCommandBuffer cmd, VkImage image,
                               VkImageLayout oldLayout, VkImageLayout newLayout,
-                              uint32_t mipLevels, VkImageAspectFlags aspectMask) {
+                              uint32_t mipLevels, VkImageAspectFlags aspectMask,
+                              uint32_t layerCount) {
     VkImageMemoryBarrier barrier{};
     barrier.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barrier.oldLayout           = oldLayout;
@@ -136,7 +149,7 @@ void Image::transitionLayout(VkCommandBuffer cmd, VkImage image,
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image               = image;
-    barrier.subresourceRange    = {aspectMask, 0, mipLevels, 0, 1};
+    barrier.subresourceRange    = {aspectMask, 0, mipLevels, 0, layerCount};
 
     VkPipelineStageFlags srcStage{};
     VkPipelineStageFlags dstStage{};
@@ -209,6 +222,29 @@ void Image::copyFromBuffer(VkCommandBuffer cmd, VkBuffer src, VkImage dst,
     region.imageExtent       = {width, height, 1};
 
     vkCmdCopyBufferToImage(cmd, src, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+}
+
+void Image::copyFromBufferLayers(VkCommandBuffer cmd, VkBuffer src, VkImage dst,
+                                  uint32_t width, uint32_t height, uint32_t layerCount,
+                                  VkDeviceSize bytesPerLayer) {
+    // Default bytes per layer: tightly-packed RGBA8 pixels.
+    if (bytesPerLayer == 0)
+        bytesPerLayer = static_cast<VkDeviceSize>(width) * height * 4;
+
+    std::vector<VkBufferImageCopy> regions;
+    regions.reserve(layerCount);
+    for (uint32_t i = 0; i < layerCount; ++i) {
+        VkBufferImageCopy region{};
+        region.bufferOffset      = i * bytesPerLayer;
+        region.bufferRowLength   = 0;
+        region.bufferImageHeight = 0;
+        region.imageSubresource  = {VK_IMAGE_ASPECT_COLOR_BIT, 0, i, 1};
+        region.imageOffset       = {0, 0, 0};
+        region.imageExtent       = {width, height, 1};
+        regions.push_back(region);
+    }
+    vkCmdCopyBufferToImage(cmd, src, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           static_cast<uint32_t>(regions.size()), regions.data());
 }
 
 uint32_t Image::calcMipLevels(uint32_t width, uint32_t height) {

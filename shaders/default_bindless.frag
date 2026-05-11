@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_nonuniform_qualifier : enable
 
 layout(location = 0) in vec3 fragWorldPos;
 layout(location = 1) in vec3 fragNormal;
@@ -41,22 +42,20 @@ layout(set = 0, binding = 0) uniform GlobalUBO {
     ivec4    iblParams;     // x=iblEnabled, y=maxPrefilterLod (packed as int)
 } ubo;
 
-// Per-material albedo texture (set 1, binding 0)
-layout(set = 1, binding = 0) uniform sampler2D albedoTex;
-
-// Per-material normal map (set 1, binding 1); used when HasNormalMap flag is set.
-layout(set = 1, binding = 1) uniform sampler2D normalTex;
+// Bindless texture array (set=1, binding=0) -- G2 bindless path.
+// All scene textures are registered here; accessed via per-instance indices in GPUMaterial.
+layout(set = 1, binding = 0) uniform sampler2D bindlessTextures[];
 
 // Material SSBO (set=0, binding=3) -- must match GPUMaterial in Material.h (std430, 48 bytes)
 struct GPUMaterial {
-    vec4  baseColor;  // rgba tint applied to albedo
-    float roughness;  // [0,1] Cook-Torrance roughness
-    float metallic;   // [0,1] metallic factor
-    float emissive;   // emissive glow multiplier (albedo * emissive added to output)
-    uint  flags;      // bit0=unlit, bit1=alphaTest, bit2=UsePBR, bit3=HasNormalMap
-    uint  albedoTexIdx;   // bindless index for albedo texture (Track G)
-    uint  normalTexIdx;   // bindless index for normal map (Track G)
-    uint  _pad2, _pad3;   // reserved
+    vec4  baseColor;     // rgba tint applied to albedo
+    float roughness;     // [0,1] Cook-Torrance roughness
+    float metallic;      // [0,1] metallic factor
+    float emissive;      // emissive glow multiplier (albedo * emissive added to output)
+    uint  flags;         // bit0=unlit, bit1=alphaTest, bit2=UsePBR, bit3=HasNormalMap
+    uint  albedoTexIdx;  // bindless index for albedo texture
+    uint  normalTexIdx;  // bindless index for normal map
+    uint  _pad2, _pad3;  // reserved
 };
 layout(set = 0, binding = 3, std430) readonly buffer MaterialSSBO {
     GPUMaterial materials[];
@@ -71,20 +70,14 @@ layout(set = 0, binding = 5) uniform samplerCube iblPrefilter;    // specular pr
 layout(set = 0, binding = 6) uniform sampler2D   iblBrdfLut;      // BRDF integration LUT
 
 // -- Blinn-Phong per-light contribution ----------------------------------------
-// Returns the combined diffuse + specular radiance contribution of one light.
-// Uses the half-vector (Blinn) instead of reflect() (Phong) for the specular
-// term  --  more physically correct at grazing angles and cheaper to evaluate.
 vec3 blinnPhong(GPULight light, vec3 fragPos, vec3 normal, vec3 viewDir, vec3 albedo) {
     vec3  lightDir;
     float attenuation = 1.0;
     int   ltype = clamp(int(light.position.w + 0.5), 0, 2);
 
     if (ltype == 0) {
-        // -- Directional: infinite distance, uniform direction, no attenuation --
         lightDir = normalize(-light.direction.xyz);
-
     } else {
-        // -- Point / Spot: positional, distance-based attenuation --------------
         vec3  toLight = light.position.xyz - fragPos;
         float dist    = length(toLight);
         float safeDist = max(dist, 1e-4);
@@ -92,28 +85,20 @@ vec3 blinnPhong(GPULight light, vec3 fragPos, vec3 normal, vec3 viewDir, vec3 al
 
         float range = max(light.direction.w, 1e-4);
         float ratio = clamp(dist / range, 0.0, 1.0);
-        // Smooth inverse-square-like falloff that reaches 0 at range
         attenuation = clamp(1.0 - ratio * ratio, 0.0, 1.0);
         attenuation *= attenuation;
 
         if (ltype == 2) {
-            // -- Spot: angular cone falloff on top of distance attenuation -----
             float cosAngle = dot(-lightDir, normalize(light.direction.xyz));
-            float inner    = light.spotAngles.x; // cos(innerAngle)
-            float outer    = light.spotAngles.y; // cos(outerAngle)
-            // Smooth blend between inner (full) and outer (zero) cone edges
+            float inner    = light.spotAngles.x;
+            float outer    = light.spotAngles.y;
             attenuation *= clamp((cosAngle - outer) / max(inner - outer, 0.001), 0.0, 1.0);
         }
     }
 
-    // -- Diffuse (Lambertian) ---------------------------------------------------
     float NdotL  = max(dot(normal, lightDir), 0.0);
     vec3  diffuse = NdotL * albedo;
 
-    // -- Specular (Blinn-Phong half-vector) ------------------------------------
-    // Half-vector between light and view; the epsilon prevents a zero-vector
-    // normalize when lightDir and viewDir are perfectly opposite.
-    // Shininess=64 is hardcoded; promote to a material UBO field to vary per object.
     vec3  halfVec  = normalize(lightDir + viewDir + vec3(1e-6));
     float NdotH    = max(dot(normal, halfVec), 0.0);
     float specular = pow(NdotH, 64.0) * 0.4;
@@ -124,7 +109,6 @@ vec3 blinnPhong(GPULight light, vec3 fragPos, vec3 normal, vec3 viewDir, vec3 al
 
 // -- Cook-Torrance PBR BRDF functions ------------------------------------------
 
-// GGX / Trowbridge-Reitz normal distribution function.
 float D_GGX(float NdotH, float roughness) {
     float a  = roughness * roughness;
     float a2 = a * a;
@@ -132,7 +116,6 @@ float D_GGX(float NdotH, float roughness) {
     return a2 / (3.14159265 * d * d);
 }
 
-// Smith GGX geometry function (combined masking + shadowing).
 float G_SmithGGX(float NdotV, float NdotL, float roughness) {
     float r  = roughness + 1.0;
     float k  = (r * r) / 8.0;
@@ -141,18 +124,14 @@ float G_SmithGGX(float NdotV, float NdotL, float roughness) {
     return g1 * g2;
 }
 
-// Schlick Fresnel approximation.
 vec3 F_Schlick(float VdotH, vec3 F0) {
     return F0 + (1.0 - F0) * pow(clamp(1.0 - VdotH, 0.0, 1.0), 5.0);
 }
 
-// Schlick Fresnel with roughness factor (for IBL ambient term).
 vec3 F_SchlickRoughness(float cosTheta, vec3 F0, float roughness) {
     return F0 + (max(vec3(1.0 - roughness), F0) - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
-// Full Cook-Torrance BRDF for one direct light.
-// Uses the same attenuation model as blinnPhong() for consistency.
 vec3 cookTorrance(GPULight light, vec3 fragPos, vec3 normal, vec3 viewDir,
                   vec3 albedo, float roughness, float metallic) {
     vec3  lightDir;
@@ -188,77 +167,61 @@ vec3 cookTorrance(GPULight light, vec3 fragPos, vec3 normal, vec3 viewDir,
     float NdotH   = max(dot(normal, halfVec), 0.0);
     float VdotH   = max(dot(viewDir, halfVec), 0.0);
 
-    // F0: base reflectance at normal incidence.
-    // Metals use their albedo color as F0; dielectrics use ~0.04.
     vec3 F0 = mix(vec3(0.04), albedo, metallic);
 
     float D = D_GGX(NdotH, max(roughness, 0.05));
     float G = G_SmithGGX(NdotV, NdotL, roughness);
     vec3  F = F_Schlick(VdotH, F0);
 
-    // Specular BRDF term.
     vec3 numerator    = D * G * F;
     float denominator = 4.0 * NdotV * NdotL + 0.0001;
     vec3  specular    = numerator / denominator;
 
-    // Energy conservation: kd must be zero for metals.
     vec3 kd = (1.0 - F) * (1.0 - metallic);
 
     vec3 lightRadiance = light.color.rgb * light.color.a;
     return (kd * albedo / 3.14159265 + specular) * lightRadiance * attenuation * NdotL;
 }
 
-// -- Normal map perturbation (screen-space TBN, no tangent vertex attribute) ---
-// Builds a TBN matrix from screen-space derivatives of position and UV,
-// then transforms the tangent-space normal sample into world space.
-vec3 perturbNormal(vec3 worldNormal, vec3 worldPos, vec2 uv) {
+// -- Normal map perturbation (bindless variant) --------------------------------
+// normalTexIdx: bindless array index for the normal map texture.
+vec3 perturbNormal(vec3 worldNormal, vec3 worldPos, vec2 uv, uint normalTexIdx) {
     vec3 dPdx = dFdx(worldPos);
     vec3 dPdy = dFdy(worldPos);
     vec2 dUdx = dFdx(uv);
     vec2 dUdy = dFdy(uv);
 
-    // Solve for tangent T and bitangent B:
-    // dPdx = T*dUdx.x + B*dUdx.y
-    // dPdy = T*dUdy.x + B*dUdy.y
     float det = dUdx.x * dUdy.y - dUdy.x * dUdx.y;
     float rcpDet = 1.0 / (abs(det) + 1e-8);
 
     vec3 T = rcpDet * (dUdy.y * dPdx - dUdx.y * dPdy);
     vec3 B = rcpDet * (dUdx.x * dPdy - dUdy.x * dPdx);
 
-    // Re-orthogonalize T against the surface normal.
     vec3 N = normalize(worldNormal);
     T = normalize(T - dot(T, N) * N);
     B = normalize(B - dot(B, N) * N);
 
-    // Sample tangent-space normal, remap from [0,1] to [-1,1].
-    vec3 tn = texture(normalTex, uv).rgb * 2.0 - 1.0;
+    // Sample the normal map from the bindless array using nonuniformEXT.
+    vec3 tn = texture(bindlessTextures[nonuniformEXT(normalTexIdx)], uv).rgb * 2.0 - 1.0;
 
-    // Transform from tangent space to world space using the TBN matrix.
     return normalize(T * tn.x + B * tn.y + N * tn.z);
 }
 
 // -- IBL ambient contribution --------------------------------------------------
-// Diffuse: irradiance cubemap sample.
-// Specular: split-sum approximation -- prefiltered env map + BRDF LUT.
 vec3 evalIBL(vec3 normal, vec3 viewDir, vec3 albedo, float roughness, float metallic, vec3 F0) {
     float NdotV = max(dot(normal, viewDir), 0.0);
 
-    // Fresnel with roughness factor for ambient term.
     vec3 F     = F_SchlickRoughness(NdotV, F0, roughness);
     vec3 kd    = (1.0 - F) * (1.0 - metallic);
 
-    // Diffuse IBL: irradiance cubemap gives pre-integrated Lambertian radiance.
     vec3 irradiance = texture(iblIrradiance, normal).rgb;
     vec3 diffuse    = kd * irradiance * albedo;
 
-    // Specular IBL: reflection direction sampled from prefiltered env.
     vec3  reflDir   = reflect(-viewDir, normal);
     float maxLod    = float(ubo.iblParams.y);
     float mipLevel  = roughness * maxLod;
     vec3  prefilteredColor = textureLod(iblPrefilter, reflDir, mipLevel).rgb;
 
-    // BRDF LUT: xy = (scale, bias) for the specular integral.
     vec2 brdf = texture(iblBrdfLut, vec2(NdotV, roughness)).rg;
     vec3 specular = prefilteredColor * (F0 * brdf.x + brdf.y);
 
@@ -266,7 +229,6 @@ vec3 evalIBL(vec3 normal, vec3 viewDir, vec3 albedo, float roughness, float meta
 }
 
 // -- Manual 3x3 PCF shadow test ------------------------------------------------
-// Returns 1.0 (fully lit) to 0.0 (fully shadowed).
 vec2 cascadeTexelSize(int cascadeIdx) {
     if (cascadeIdx == 0) return 1.0 / vec2(textureSize(shadowMaps[0], 0));
     if (cascadeIdx == 1) return 1.0 / vec2(textureSize(shadowMaps[1], 0));
@@ -284,11 +246,9 @@ float cascadeDepth(int cascadeIdx, vec2 uv) {
 float shadowTest(int cascadeIdx, vec3 fragWorldPos, float bias) {
     vec4 lightSpacePos = ubo.lightSpaceMatrices[cascadeIdx] * vec4(fragWorldPos, 1.0);
     vec3 projCoords    = lightSpacePos.xyz / lightSpacePos.w;
-    // Convert from NDC [-1,1] to shadow map UV [0,1]
     vec2 shadowUV      = projCoords.xy * 0.5 + 0.5;
     float currentDepth = projCoords.z;
 
-    // Fragment is outside the shadow frustum -- consider it lit
     if (currentDepth > 1.0 || currentDepth < 0.0) return 1.0;
 
     float shadow    = 0.0;
@@ -303,30 +263,28 @@ float shadowTest(int cascadeIdx, vec3 fragWorldPos, float bias) {
 }
 
 void main() {
-    // Fetch the material for this instance (index provided by vertex shader).
     GPUMaterial mat = matSSBO.materials[fragMaterialId];
 
-    vec3 normal  = normalize(fragNormal);
+    vec3 normal = normalize(fragNormal);
 
     // Optionally perturb the surface normal using a tangent-space normal map.
     if ((mat.flags & 8u) != 0u) {
-        normal = perturbNormal(normal, fragWorldPos, fragTexCoord);
+        normal = perturbNormal(normal, fragWorldPos, fragTexCoord, mat.normalTexIdx);
     }
 
     vec3 viewDir = normalize(ubo.cameraPos.xyz - fragWorldPos);
 
-    // Albedo: texture sample * vertex color * material tint.
-    vec4 texSample = texture(albedoTex, fragTexCoord) * fragColor;
+    // Albedo: sample from bindless array using per-instance albedoTexIdx.
+    vec4 texSample = texture(bindlessTextures[nonuniformEXT(mat.albedoTexIdx)],
+                             fragTexCoord) * fragColor;
     vec3 albedo    = texSample.rgb * mat.baseColor.rgb;
     float alpha    = texSample.a  * mat.baseColor.a;
 
-    // Emissive: additive glow (not affected by lighting or shadows).
     vec3 emissive = albedo * mat.emissive;
 
     vec3 result;
 
     if ((mat.flags & 1u) != 0u) {
-        // Unlit: skip all lighting; output albedo + emissive directly.
         result = albedo + emissive;
     } else if ((mat.flags & 4u) != 0u) {
         // -- PBR lit path (Cook-Torrance BRDF) ---------------------------------
@@ -334,14 +292,12 @@ void main() {
         float metallic  = clamp(mat.metallic,  0.0,  1.0);
         vec3  F0        = mix(vec3(0.04), albedo, metallic);
 
-        // Ambient term: IBL or simple ambient depending on iblEnabled.
         if (ubo.iblParams.x != 0) {
             result = evalIBL(normal, viewDir, albedo, roughness, metallic, F0);
         } else {
             result = ubo.ambientColor.rgb * ubo.ambientColor.a * albedo;
         }
 
-        // Shadow visibility
         float shadowVis = 1.0;
         if (ubo.shadowMeta.y != 0 && fragViewDepth > 0.0) {
             int cascadeIdx = max(ubo.shadowMeta.x - 1, 0);
@@ -354,7 +310,6 @@ void main() {
             shadowVis = shadowTest(cascadeIdx, fragWorldPos, ubo.shadowParams.x);
         }
 
-        // Accumulate direct PBR light contributions.
         int activeLights = min(ubo.lightCount, LIGHT_CAP);
         for (int i = 0; i < activeLights; ++i) {
             result += cookTorrance(ubo.lights[i], fragWorldPos, normal, viewDir,
@@ -364,10 +319,8 @@ void main() {
         result += emissive;
     } else {
         // -- Lit path (Blinn-Phong + shadow) -----------------------------------
-        // Ambient term: not shadowed (shadow applies to direct light only)
         result = ubo.ambientColor.rgb * ubo.ambientColor.a * albedo;
 
-        // Shadow visibility (1.0 = fully lit, 0.0 = fully in shadow)
         float shadowVis = 1.0;
         if (ubo.shadowMeta.y != 0 && fragViewDepth > 0.0) {
             int cascadeIdx = max(ubo.shadowMeta.x - 1, 0);
@@ -380,7 +333,6 @@ void main() {
             shadowVis = shadowTest(cascadeIdx, fragWorldPos, ubo.shadowParams.x);
         }
 
-        // Accumulate direct light contributions, modulated by shadow
         int activeLights = min(ubo.lightCount, LIGHT_CAP);
         for (int i = 0; i < activeLights; ++i) {
             result += blinnPhong(ubo.lights[i], fragWorldPos, normal, viewDir, albedo) * shadowVis;
@@ -392,13 +344,9 @@ void main() {
     outColor = vec4(result, alpha);
 
     // -- E3: Debug visualization overlay (iblParams.z = debugVizMode) ----------
-    // Overrides the final output; 0 = off (normal rendering).
     int vizMode = ubo.iblParams.z;
 
     if (vizMode == 1) {
-        // Cascade index visualization -- color by which shadow cascade this fragment uses.
-        // Guarded on shadowMeta.y (shadow enabled) to avoid garbage cascade indices.
-        // If shadows are disabled, shows a neutral grey.
         if (ubo.shadowMeta.y != 0) {
             int cascadeIdx = max(ubo.shadowMeta.x - 1, 0);
             for (int i = 0; i < ubo.shadowMeta.x; ++i) {
@@ -407,7 +355,6 @@ void main() {
                     break;
                 }
             }
-            // Cascade colors: 0=red, 1=green, 2=blue, 3=yellow.
             vec3 cascadeColors[4];
             cascadeColors[0] = vec3(1.0, 0.2, 0.2);
             cascadeColors[1] = vec3(0.2, 1.0, 0.2);
@@ -418,11 +365,8 @@ void main() {
             outColor = vec4(0.5, 0.5, 0.5, 1.0);
         }
     } else if (vizMode == 2) {
-        // World normal visualization: RGB = world normal * 0.5 + 0.5.
         outColor = vec4(normal * 0.5 + 0.5, 1.0);
     } else if (vizMode == 3) {
-        // Roughness/Metallic visualization: R=metallic, G=roughness, B=0.
-        // Uses material values before any lighting computation.
         outColor = vec4(mat.metallic, mat.roughness, 0.0, 1.0);
     }
 }

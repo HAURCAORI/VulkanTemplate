@@ -86,6 +86,53 @@ inline void insertLabel(VkCommandBuffer cmd, const char* name,
 #endif
 }
 
+// -- Queue labels --------------------------------------------------------------
+// Queue labels annotate the GPU queue timeline in RenderDoc's Queue Events panel.
+// Useful for marking frame or workload boundaries at the queue submission level.
+// Active only when VKT_VALIDATION is defined (same guard as command-buffer labels).
+
+inline void beginQueueLabel(VkQueue queue, const char* name,
+                             glm::vec4 color = {1.0f, 1.0f, 1.0f, 1.0f}) {
+#if defined(VKT_VALIDATION)
+    if (!vkQueueBeginDebugUtilsLabelEXT) return;
+    VkDebugUtilsLabelEXT label{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+    label.pLabelName = name;
+    label.color[0]   = color.r;
+    label.color[1]   = color.g;
+    label.color[2]   = color.b;
+    label.color[3]   = color.a;
+    vkQueueBeginDebugUtilsLabelEXT(queue, &label);
+#else
+    (void)queue; (void)name; (void)color;
+#endif
+}
+
+inline void endQueueLabel(VkQueue queue) {
+#if defined(VKT_VALIDATION)
+    if (!vkQueueEndDebugUtilsLabelEXT) return;
+    vkQueueEndDebugUtilsLabelEXT(queue);
+#else
+    (void)queue;
+#endif
+}
+
+// Insert a single-point annotation on the queue timeline.
+inline void insertQueueLabel(VkQueue queue, const char* name,
+                              glm::vec4 color = {1.0f, 1.0f, 1.0f, 1.0f}) {
+#if defined(VKT_VALIDATION)
+    if (!vkQueueInsertDebugUtilsLabelEXT) return;
+    VkDebugUtilsLabelEXT label{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+    label.pLabelName = name;
+    label.color[0]   = color.r;
+    label.color[1]   = color.g;
+    label.color[2]   = color.b;
+    label.color[3]   = color.a;
+    vkQueueInsertDebugUtilsLabelEXT(queue, &label);
+#else
+    (void)queue; (void)name; (void)color;
+#endif
+}
+
 // -- RAII scope guard ----------------------------------------------------------
 // Calls beginLabel on construction and endLabel on destruction.
 // Eliminates the need to remember paired endLabel calls.

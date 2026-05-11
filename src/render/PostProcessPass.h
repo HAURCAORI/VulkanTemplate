@@ -76,6 +76,10 @@ public:
     // HDR offscreen render pass (color + depth, 1x MSAA).
     // The geometry pipeline must be compiled against this render pass.
     VkRenderPass hdrRenderPass() const { return m_hdrRenderPass; }
+    VkImage hdrImage(uint32_t frameIndex) const {
+        return frameIndex < m_hdrImages.size() ? m_hdrImages[frameIndex].handle() : VK_NULL_HANDLE;
+    }
+    VkImage hdrDepthImage() const { return m_depthImage.handle(); }
 
     // Begin/end the HDR offscreen render pass (1x MSAA, R16G16B16A16_SFLOAT color).
     // beginHdr also sets dynamic viewport + scissor to the HDR extent.

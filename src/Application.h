@@ -22,6 +22,13 @@
 #include "render/PostProcessPass.h"
 #include "render/CullPass.h"
 #include "render/IndirectBuffer.h"
+#include "render/SkyPass.h"
+#include "render/IblBaker.h"
+#include "render/RenderGraph.h"
+#include "pipeline/BindlessTextureSet.h"
+#include "render/GpuTimestamps.h"
+#include "render/ShaderWatcher.h"
+#include "render/StreamLoader.h"
 #include "material/Material.h"
 #include "ui/ImGuiLayer.h"
 
@@ -37,7 +44,7 @@ namespace vkt {
 
 // Per-frame uniform data uploaded to set 0, binding 0.
 // Must stay in sync with GlobalUBO in default.vert/.frag (std140 layout).
-// Total size (kMaxShadowCascades=4): 992 bytes.
+// Total size (kMaxShadowCascades=4): 1008 bytes.
 struct GlobalUBO {
     glm::mat4 view;                                      // 64 bytes  offset   0
     glm::mat4 proj;                                      // 64 bytes  offset  64
@@ -50,9 +57,10 @@ struct GlobalUBO {
     glm::mat4 lightSpaceMatrices[RenderLimits::kMaxShadowCascades]{}; // 256 bytes offset 688
     glm::vec4 cascadeSplits{0.0f};                       // 16 bytes  offset 944
     glm::ivec4 shadowMeta{1, 0, 0, 0};                   // 16 bytes  offset 960  x=cascadeCount, y=enabled
-    glm::vec4 shadowParams{0.00015f, 0.0f, 0.0f, 0.0f};  // 16 bytes  offset 976  x=receiver bias
+    glm::vec4  shadowParams{0.00015f, 0.0f, 0.0f, 0.0f};  // 16 bytes  offset 976  x=receiver bias
+    glm::ivec4 iblParams   {0, 4, 0, 0};                  // 16 bytes  offset 992  x=iblEnabled, y=maxPrefilterLod
 };
-static_assert(sizeof(GlobalUBO) == 992, "GlobalUBO size mismatch  --  update shader UBO layout");
+static_assert(sizeof(GlobalUBO) == 1008, "GlobalUBO size mismatch  --  update shader UBO layout");
 
 // Pipeline specialization constants consumed by shaders at pipeline-create time.
 // constant_id = 0 in default.frag maps to lightCap.
@@ -106,6 +114,12 @@ public:
         float                 shadowSplitLambda = 0.65f;
         // Receiver bias used in the shading pass depth compare.
         float                 shadowReceiverBias = 0.00015f;
+        // IBL settings.
+        bool          iblEnabled          = true; // enable IBL diffuse+specular
+        int           iblMaxPrefilterLod  = 4;     // mip count in prefiltered env map
+        std::string   iblPath             = "assets/sample.hdr";    // equirectangular .hdr file; empty = placeholder IBL
+        // Sky settings.
+        SkyPass::Config sky;
         // VSync: locks the frame rate to the monitor refresh via FIFO present mode
         // (zero CPU overhead, driver-level frame pacing, no tearing).
         // Disabling uses Mailbox (triple-buffer, uncapped, low latency).
@@ -163,6 +177,48 @@ private:
     // Must be called after createDescriptors() (needs instance buffer handles).
     void createCullPass();
 
+    // Create placeholder IBL textures and write them into global descriptor sets
+    // (bindings 4=irradiance, 5=prefilter, 6=BRDF LUT).
+    void createIblResources();
+    void updateIblDescriptors();
+    void rebuildSkyIblProbe();
+    void updateSolidCubemap(Image& image, const glm::vec4& color);
+    void updateSolidImage2D(Image& image, const glm::vec4& color);
+    VkCommandBuffer beginImmediateCommands(VkCommandPool& pool) const;
+    void endImmediateCommands(VkCommandPool pool, VkCommandBuffer cmd) const;
+
+    // Initialize the sky background pass.
+    void createSkyPass(const Config& cfg);
+
+    // Build the render graph: register resources and passes, derive barriers.
+    // Called from init() after all passes are initialized.
+    // Re-called from handleResize() if image resource handles change.
+    void createRenderGraph();
+
+    // G1: Initialize bindless texture set and detect descriptor indexing support.
+    // Must be called after createDescriptors() (needs device + descriptor indexing query).
+    void createBindlessResources();
+
+    // Initialize GPU timestamp query pools (Track E1).
+    // Must be called after initVulkan() (needs device, physDevice).
+    void createGpuTimestamps();
+
+    // Start the shader file watcher (Track F1).
+    // Must be called after loadScene() (output dir resolved from exe path).
+    void createShaderWatcher();
+
+    // F2: Called each frame; if ShaderWatcher has new SPIR-V, rebuild m_pipeline.
+    // Returns true if the pipeline was swapped.
+    bool tryHotReloadPipeline();
+
+    // Initialize the async texture streaming system (Track C).
+    // Must be called after createDescriptors() (needs m_defaultImage + m_defaultSampler).
+    void createStreamLoader();
+
+    // CPU-side frame setup: build batch lists and flush per-frame GPU buffers.
+    // Called at the top of recordCommands(), before m_renderGraph.execute().
+    void prepareFrameData();
+
     // -- Per-frame logic -------------------------------------------------------
     void drawFrame();
     void recordCommands(VkCommandBuffer cmd, uint32_t imageIndex);
@@ -206,6 +262,47 @@ private:
     // Initialized in createDescriptors(); index 0 = default white material.
     MaterialManager m_materials;
 
+    // IBL baker: used once during init if iblPath is set; destroyed after baking.
+    IblBaker m_iblBaker;
+
+    // IBL resources (set=0 bindings 4,5,6): placeholder cubemaps + BRDF LUT.
+    // Destroyed in shutdown() before the allocator.
+    Image   m_iblIrradiance;
+    Image   m_iblPrefilter;
+    Image   m_iblBrdfLut;
+    Image   m_iblEnvCubemap;    // 512x512 env cube -- given to SkyPass for sky display
+    Sampler m_iblCubeSampler;   // linear+clamp for irradiance and prefiltered
+    Sampler m_iblLutSampler;    // linear+clamp for BRDF LUT
+    int     m_iblBakedMaxPrefilterLod = 0;
+
+    // Sky background pass: renders before geometry inside the HDR render pass.
+    SkyPass m_skyPass;
+
+    // Render graph: declares pass/resource dependencies and derives barriers.
+    RenderGraph m_renderGraph;
+
+    // Async texture streaming (Track C): init after m_defaultImage/Sampler exist.
+    StreamLoader m_streamLoader;
+
+    // -- Track E: Developer Observability --------------------------------------
+
+    // E1: Per-pass GPU timestamp queries.
+    // init() called after createFrameData(); destroy() before m_ctx in shutdown().
+    GpuTimestamps m_gpuTimestamps;
+
+    // Nanoseconds per GPU timer tick (from VkPhysicalDeviceLimits.timestampPeriod).
+    float    m_timestampPeriod = 1.0f;
+
+    // Total frames submitted so far.  Used to skip retrieve() for the first
+    // MAX_FRAMES_IN_FLIGHT frames (query pools are uninit before first submission).
+    uint64_t m_frameCount = 0;
+
+    // Per-frame batch lists populated by prepareFrameData() and consumed by graph passes.
+    std::vector<DrawBatch> m_currentShadowBatches;
+    std::vector<CullBatch> m_currentCullBatches;
+    uint32_t               m_currentObjectCount = 0;
+    uint32_t               m_currentImageIndex  = 0;
+
     // Phase 6: GPU compute frustum culling + indirect draw.
     // CullPass owns the compute pipeline and per-frame CullObject SSBOs.
     // IndirectBuffers hold VkDrawIndexedIndirectCommand per batch per frame.
@@ -218,6 +315,34 @@ private:
     VkDescriptorSetLayout m_materialLayout = VK_NULL_HANDLE;
     VkPipelineLayout      m_pipelineLayout = VK_NULL_HANDLE;
     VkPipeline            m_pipeline       = VK_NULL_HANDLE;
+
+    // -- Track G: Bindless Materials/Textures ----------------------------------
+
+    // G1: Runtime feature detection; set in createDescriptors().
+    bool m_bindlessSupported = false;
+    // G3: Runtime toggle; true when bindless is both supported and enabled.
+    bool m_useBindless = false;
+
+    // G1: Bindless sampler2D[] descriptor set for bindless texture access.
+    // Populated during loadScene() (index 0 = default white, index 1 = default normal).
+    BindlessTextureSet m_bindlessSet;
+
+    // G2: Bindless pipeline layout: set=0 global, set=1 bindless array.
+    // Separate from m_pipelineLayout (which uses per-material set=1 instead).
+    VkPipelineLayout m_bindlessPipelineLayout = VK_NULL_HANDLE;
+
+    // G2: Bindless geometry pipeline using default_bindless.frag.
+    VkPipeline m_bindlessPipeline = VK_NULL_HANDLE;
+
+    // -- Track H: Memory Budget Dashboard -------------------------------------
+
+    // Number of Vulkan memory heaps on this device (from physicalDeviceMemoryProperties).
+    // Queried once in initVulkan(); used to bound the heap loop in renderUI().
+    uint32_t    m_heapCount = 0;
+
+    // Session-peak GPU allocation per heap (our allocator's blockBytes, in bytes).
+    // Updated each frame in renderUI() as we read VmaBudget.statistics.blockBytes.
+    VkDeviceSize m_heapPeaks[VK_MAX_MEMORY_HEAPS]{};
 
     DescriptorPool m_descriptorPool;
 
@@ -246,6 +371,11 @@ private:
     Sampler         m_defaultSampler;
     VkDescriptorSet m_defaultMaterialSet = VK_NULL_HANDLE;
 
+    // Default 1x1 flat normal map (tangent-space neutral, 128,128,255,255).
+    // Written to binding 1 of every material descriptor set that lacks a real normal map.
+    Image   m_defaultNormalImage;
+    Sampler m_defaultNormalSampler;
+
     // ObjectIds for demo-scene animated objects (INVALID_HANDLE if using sceneFile).
     ObjectId m_groundId = INVALID_HANDLE;
     ObjectId m_sphereId = INVALID_HANDLE;
@@ -269,6 +399,50 @@ private:
     // Key debounce state (rising-edge detection for toggle keys)
     bool m_oPrevPressed = false;
 
+    // E3: Debug visualization overlay mode (stored in GlobalUBO.iblParams.z each frame).
+    //   0 = normal rendering
+    //   1 = cascade index (red/green/blue/yellow per cascade)
+    //   2 = world normals (N * 0.5 + 0.5)
+    //   3 = roughness/metallic (R=metallic, G=roughness)
+    int  m_debugVizMode = 0;
+
+    // E4: Trigger a "CAPTURE_FRAME" debug label around the next frame's commands.
+    // Set by processInput() on F11 rising edge; consumed and cleared in recordCommands().
+    bool m_captureNextFrame = false;
+    bool m_captureKeyPrev   = false;
+
+    // -- Track I: GPU Crash Resiliency -----------------------------------------
+
+    // I1: Called at any VK_ERROR_DEVICE_LOST detection point.
+    // Logs a structured diagnostic (frame, stage, active passes) to stderr,
+    // sets m_deviceLost so the run loop exits and shutdown() skips DeviceWaitIdle.
+    void reportDeviceLost(VkResult result, const char* stage);
+
+    // Set to true the first time reportDeviceLost() is called.
+    bool m_deviceLost = false;
+
+    // Context captured at the moment of loss (for ImGui display and logs).
+    struct DeviceLostInfo {
+        uint64_t    frame    = 0;        // m_frameCount at time of loss
+        std::string stage;               // "vkQueueSubmit", "vkQueuePresentKHR", etc.
+        std::string passNames;           // "; "-joined render graph pass names
+    };
+    DeviceLostInfo m_deviceLostInfo;
+
+    // -- Track F: Pipeline Hot Reload ------------------------------------------
+
+    // F1: Background file watcher + recompiler.
+    ShaderWatcher m_shaderWatcher;
+
+    // F2: Pipelines queued for deferred destruction.
+    // An old pipeline is destroyed only after MAX_FRAMES_IN_FLIGHT frames have
+    // passed so no in-flight command buffer still references it.
+    struct DeferredPipeline {
+        VkPipeline pipeline;
+        uint64_t   destroyAfterFrame; // destroy when m_frameCount >= this value
+    };
+    std::vector<DeferredPipeline> m_deferredPipelineDestroys;
+
     // Mouse state (for camera look)
     float  m_mouseSensitivity = 0.1f;
     double m_lastMouseX       = 0.0, m_lastMouseY = 0.0;
@@ -278,6 +452,8 @@ private:
     float  m_shadowReceiverBias = 0.00015f;
     // Shadow caster light index. -1 = auto (highest-intensity directional).
     int    m_shadowLightIndex   = -1;
+    float  m_lastSkyProbeUpdateTime = -1000.0f;
+    float  m_skyProbeUpdateInterval = 0.5f;
 };
 
 } // namespace vkt

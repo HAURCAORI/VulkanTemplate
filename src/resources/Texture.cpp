@@ -11,7 +11,8 @@ namespace vkt {
 
 void Texture::loadFromFile(VmaAllocator allocator, VkDevice device, VkPhysicalDevice physDevice,
                             VkCommandBuffer cmd, Buffer& outStaging,
-                            const std::string& path) {
+                            const std::string& path,
+                            ColorSpace colorSpace) {
     std::scoped_lock lock(m_mutex);
     // STBI_rgb_alpha forces 4-channel output regardless of source format, so
     // the GPU format is always VK_FORMAT_R8G8B8A8_SRGB  --  no per-format branching.
@@ -22,7 +23,9 @@ void Texture::loadFromFile(VmaAllocator allocator, VkDevice device, VkPhysicalDe
                                  + stbi_failure_reason());
 
     const VkDeviceSize imageSize = static_cast<VkDeviceSize>(w) * h * 4;
-    const VkFormat texFormat = VK_FORMAT_R8G8B8A8_SRGB;
+    const VkFormat texFormat = (colorSpace == ColorSpace::Srgb)
+        ? VK_FORMAT_R8G8B8A8_SRGB
+        : VK_FORMAT_R8G8B8A8_UNORM;
     VkFormatProperties formatProps{};
     vkGetPhysicalDeviceFormatProperties(physDevice, texFormat, &formatProps);
     const bool supportsLinearBlit =

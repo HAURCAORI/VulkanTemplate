@@ -1,0 +1,42 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D equirectMap;
+layout(set = 0, binding = 1, rgba16f) writeonly uniform image2DArray outCube;
+
+layout(push_constant) uniform Push {
+    uint faceSize;
+} push;
+
+// Map cubemap face + pixel coord to a 3D direction vector.
+// Vulkan cubemap face order and sc/tc axes (Vulkan spec Table 15.1):
+//   +X: sc=-rz, tc=-ry   -X: sc=+rz, tc=-ry
+//   +Y: sc=+rx, tc=+rz   -Y: sc=+rx, tc=-rz
+//   +Z: sc=+rx, tc=-ry   -Z: sc=-rx, tc=-ry
+vec3 faceDir(uint face, vec2 uv) { // uv in [-1,1]
+    if (face == 0u) return normalize(vec3( 1.0, -uv.y, -uv.x));
+    if (face == 1u) return normalize(vec3(-1.0, -uv.y,  uv.x));
+    if (face == 2u) return normalize(vec3( uv.x,  1.0,  uv.y));
+    if (face == 3u) return normalize(vec3( uv.x, -1.0, -uv.y));
+    if (face == 4u) return normalize(vec3( uv.x, -uv.y,  1.0));
+    return normalize(vec3(-uv.x, -uv.y, -1.0)); // face 5
+}
+
+vec2 dirToEquirect(vec3 d) {
+    // atan(z,x) maps longitude; asin(y) maps latitude.
+    // v is flipped: zenith (+Y) -> v=0 (top of equirect image).
+    const vec2 invAtan = vec2(0.15915494, 0.31830989); // 1/(2*pi), 1/pi
+    return vec2(atan(d.z, d.x) * invAtan.x + 0.5,
+               -asin(clamp(d.y, -1.0, 1.0)) * invAtan.y + 0.5);
+}
+
+void main() {
+    uint  face  = gl_GlobalInvocationID.z;
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= int(push.faceSize) || coord.y >= int(push.faceSize)) return;
+
+    vec2 uv  = (vec2(coord) + 0.5) / float(push.faceSize) * 2.0 - 1.0;
+    vec3 dir = faceDir(face, uv);
+    vec4 color = texture(equirectMap, dirToEquirect(dir));
+    imageStore(outCube, ivec3(coord, int(face)), vec4(color.rgb, 1.0));
+}

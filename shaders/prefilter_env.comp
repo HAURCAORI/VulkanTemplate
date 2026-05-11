@@ -1,0 +1,83 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform samplerCube envMap;
+layout(set = 0, binding = 1, rgba16f) writeonly uniform image2DArray outPrefilter;
+
+layout(push_constant) uniform Push {
+    uint  faceSize;
+    float roughness;
+    uint  sampleCount;
+} push;
+
+const float PI = 3.14159265359;
+
+// Map cubemap face + pixel coord to a 3D direction vector.
+// Vulkan cubemap face order and sc/tc axes (Vulkan spec Table 15.1):
+//   +X: sc=-rz, tc=-ry   -X: sc=+rz, tc=-ry
+//   +Y: sc=+rx, tc=+rz   -Y: sc=+rx, tc=-rz
+//   +Z: sc=+rx, tc=-ry   -Z: sc=-rx, tc=-ry
+vec3 faceDir(uint face, vec2 uv) { // uv in [-1,1]
+    if (face == 0u) return normalize(vec3( 1.0, -uv.y, -uv.x));
+    if (face == 1u) return normalize(vec3(-1.0, -uv.y,  uv.x));
+    if (face == 2u) return normalize(vec3( uv.x,  1.0,  uv.y));
+    if (face == 3u) return normalize(vec3( uv.x, -1.0, -uv.y));
+    if (face == 4u) return normalize(vec3( uv.x, -uv.y,  1.0));
+    return normalize(vec3(-uv.x, -uv.y, -1.0)); // face 5
+}
+
+// Van der Corput radical inverse (base 2) for Hammersley low-discrepancy sequence.
+float radicalInverse(uint bits) {
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return float(bits) * 2.3283064365386963e-10;
+}
+
+vec2 hammersley(uint i, uint N) {
+    return vec2(float(i) / float(N), radicalInverse(i));
+}
+
+// GGX importance sample: returns a half-vector H in tangent space.
+vec3 importanceSampleGGX(vec2 xi, float roughness) {
+    float a        = roughness * roughness;
+    float phi      = 2.0 * PI * xi.x;
+    float cosTheta = sqrt((1.0 - xi.y) / (1.0 + (a * a - 1.0) * xi.y));
+    float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+    return vec3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+}
+
+void main() {
+    uint  face  = gl_GlobalInvocationID.z;
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= int(push.faceSize) || coord.y >= int(push.faceSize)) return;
+
+    vec2 uv = (vec2(coord) + 0.5) / float(push.faceSize) * 2.0 - 1.0;
+    vec3 N  = faceDir(face, uv); // treat N = V = R (isotropic assumption)
+
+    // Build TBN from N.
+    vec3 up    = abs(N.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 right = normalize(cross(up, N));
+    up         = cross(N, right);
+
+    vec3  prefilteredColor = vec3(0.0);
+    float totalWeight      = 0.0;
+    float r                = max(push.roughness, 0.001);
+
+    for (uint i = 0u; i < push.sampleCount; ++i) {
+        vec2 xi = hammersley(i, push.sampleCount);
+        vec3 H  = importanceSampleGGX(xi, r);
+        // Transform H from tangent space to world space.
+        H = normalize(right * H.x + up * H.y + N * H.z);
+        vec3  L     = normalize(2.0 * dot(N, H) * H - N);
+        float NdotL = max(dot(N, L), 0.0);
+        if (NdotL > 0.0) {
+            prefilteredColor += texture(envMap, L).rgb * NdotL;
+            totalWeight      += NdotL;
+        }
+    }
+    prefilteredColor = (totalWeight > 0.0) ? prefilteredColor / totalWeight : prefilteredColor;
+    imageStore(outPrefilter, ivec3(coord, int(face)), vec4(prefilteredColor, 1.0));
+}

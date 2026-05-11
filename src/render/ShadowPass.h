@@ -76,6 +76,9 @@ public:
 
     // Shadow depth image views and shared sampler -- write to global binding=2 array.
     std::vector<VkImageView> depthViews() const;
+    VkImage depthImage(uint32_t cascadeIdx) const {
+        return cascadeIdx < m_cascades.size() ? m_cascades[cascadeIdx].image.handle() : VK_NULL_HANDLE;
+    }
     VkSampler   sampler() const { return m_shadowSampler; }
 
     bool enabled()        const { return m_enabled; }

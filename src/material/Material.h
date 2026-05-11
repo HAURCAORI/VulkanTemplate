@@ -15,25 +15,29 @@ namespace vkt {
 // Written into the material SSBO at set=0, binding=3.
 // The fragment shader indexes by InstanceData::materialId.
 //
-// All fields are placeholder-ready: the current lighting model uses
-// baseColor as an albedo tint, emissive as an additive glow multiplier,
-// and flags.bit0 to skip lighting entirely (unlit objects).
-// roughness and metallic are reserved for a future PBR lighting model.
+// baseColor, roughness, metallic, and emissive are consumed directly by the
+// fragment shader. Texture bindings are still provided via set 1 descriptors;
+// the reserved slots at the end of the struct are left for a future indexed /
+// bindless material path.
 struct GPUMaterial {
     glm::vec4 baseColor {1.0f, 1.0f, 1.0f, 1.0f};  // 16 bytes offset  0: rgba tint
-    float     roughness = 0.5f;   //  4 bytes  offset 16: [0,1]  (reserved for PBR)
-    float     metallic  = 0.0f;   //  4 bytes  offset 20: [0,1]  (reserved for PBR)
+    float     roughness = 0.5f;   //  4 bytes  offset 16: [0,1]
+    float     metallic  = 0.0f;   //  4 bytes  offset 20: [0,1]
     float     emissive  = 0.0f;   //  4 bytes  offset 24: emissive glow multiplier
-    uint32_t  flags     = 0;      //  4 bytes  offset 28: bit0=unlit, bit1=alphaTest
-    uint32_t  _pad[4]   = {};     // 16 bytes  offset 32: reserved for future use
+    uint32_t  flags     = 0;      //  4 bytes  offset 28: bit0=unlit, bit1=alphaTest, bit2=PBR, bit3=hasNormalMap
+    uint32_t  albedoTexIdx = 0;   //  4 bytes  offset 32: bindless index for albedo texture (Track G)
+    uint32_t  normalTexIdx = 0;   //  4 bytes  offset 36: bindless index for normal map (Track G)
+    uint32_t  _pad[2]   = {};     //  8 bytes  offset 40: reserved
 };
 static_assert(sizeof(GPUMaterial) == 48,
-    "GPUMaterial size mismatch -- update GLSL struct in default.frag");
+    "GPUMaterial size mismatch -- update GLSL structs in default.frag and default_bindless.frag");
 
 // Bit flags for GPUMaterial::flags.
 namespace MaterialFlags {
-    inline constexpr uint32_t Unlit      = 1u << 0;  // skip lighting; output albedo only
-    inline constexpr uint32_t AlphaTest  = 1u << 1;  // discard fragments below alpha threshold
+    inline constexpr uint32_t Unlit        = 1u << 0;  // skip lighting; output albedo only
+    inline constexpr uint32_t AlphaTest    = 1u << 1;  // discard fragments below alpha threshold
+    inline constexpr uint32_t UsePBR       = 1u << 2;  // Cook-Torrance BRDF instead of Blinn-Phong
+    inline constexpr uint32_t HasNormalMap = 1u << 3;  // normal map at set=1, binding=1
 }
 
 // Owns a persistently-mapped GPU SSBO of GPUMaterial entries.

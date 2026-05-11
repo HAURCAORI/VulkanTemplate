@@ -10,7 +10,8 @@
 namespace vkt {
 
 // GPU texture loaded from a file (PNG / JPG / BMP / TGA via stb_image).
-// Always decoded as RGBA8 so the GPU format is always VK_FORMAT_R8G8B8A8_SRGB.
+// Always decoded as RGBA8; the GPU format is VK_FORMAT_R8G8B8A8_SRGB for color
+// textures and VK_FORMAT_R8G8B8A8_UNORM for linear data such as normal maps.
 // Automatically generates a full mip chain when the device supports linear
 // blitting for the format; falls back to a single mip level otherwise.
 //
@@ -29,6 +30,11 @@ namespace vkt {
 //       .update(device, materialSet);
 class Texture {
 public:
+    enum class ColorSpace {
+        Srgb,
+        Linear,
+    };
+
     Texture() = default;
     ~Texture();
     Texture(const Texture&)            = delete;
@@ -39,7 +45,8 @@ public:
     // the GPU has finished executing it (e.g. after vkQueueWaitIdle).
     void loadFromFile(VmaAllocator allocator, VkDevice device, VkPhysicalDevice physDevice,
                       VkCommandBuffer cmd, Buffer& outStaging,
-                      const std::string& path);
+                      const std::string& path,
+                      ColorSpace colorSpace = ColorSpace::Srgb);
 
     void destroy();
 

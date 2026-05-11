@@ -98,7 +98,6 @@ ObjectId RenderWorld::spawn(MeshHandle meshH, TextureHandle texH,
 
     if (texH >= m_textures.size() || m_textures[texH].set == VK_NULL_HANDLE) {
         const TextureHandle defaultH = findTexture("default");
-        assert(defaultH != INVALID_HANDLE && "RenderWorld: \"default\" texture must be registered before spawning objects with an invalid texture handle");
         if (defaultH == INVALID_HANDLE)
             return INVALID_HANDLE;
         texH = defaultH;
@@ -471,10 +470,13 @@ uint32_t RenderWorld::buildCullData(CullObject*             cullObjectsOut,
 
 void RenderWorld::drawIndirect(VkCommandBuffer cmd, VkPipelineLayout layout,
                                 const std::vector<CullBatch>& batches,
-                                VkBuffer indirectBuffer) const {
+                                VkBuffer indirectBuffer,
+                                bool skipTextureBinds) const {
     VkDescriptorSet lastSet = VK_NULL_HANDLE;
     for (const auto& b : batches) {
-        if (b.textureSet != lastSet) {
+        // In the bindless path the caller has already bound the bindless set to
+        // slot 1; per-batch binds are skipped to avoid overwriting it.
+        if (!skipTextureBinds && b.textureSet != lastSet) {
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                     layout, 1, 1, &b.textureSet, 0, nullptr);
             lastSet = b.textureSet;
