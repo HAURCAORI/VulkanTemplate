@@ -176,7 +176,8 @@ void RenderPass::createFramebuffers() {
 
 void RenderPass::destroyFramebuffers() {
     for (auto fb : m_framebuffers)
-        vkDestroyFramebuffer(m_ctx->device(), fb, nullptr);
+        if (fb != VK_NULL_HANDLE)
+            vkDestroyFramebuffer(m_ctx->device(), fb, nullptr);
     m_framebuffers.clear();
 }
 

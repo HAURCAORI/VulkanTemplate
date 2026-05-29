@@ -838,18 +838,45 @@ void Application::createPipelineCache() {
     VkPipelineCacheCreateInfo cacheInfo{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
 
     // Attempt to seed the cache with data saved from a previous run.
-    // The driver validates the data internally; corrupted or mismatched data
-    // (different GPU / driver version) is silently discarded.
+    // The spec requires drivers to silently discard incompatible cache data,
+    // but some drivers on new hardware are buggy here.  Validate the header
+    // ourselves and skip the data if the GPU UUID does not match.
     std::vector<uint8_t> cacheData;
     if (std::ifstream f("pipeline_cache.bin", std::ios::binary | std::ios::ate); f.good()) {
         const auto size = static_cast<size_t>(f.tellg());
-        f.seekg(0);
-        cacheData.resize(size);
-        f.read(reinterpret_cast<char*>(cacheData.data()),
-               static_cast<std::streamsize>(size));
-        cacheInfo.initialDataSize = cacheData.size();
-        cacheInfo.pInitialData    = cacheData.data();
-        std::printf("[App] Pipeline cache loaded (%zu bytes)\n", size);
+        // The Vulkan pipeline cache header (VkPipelineCacheHeaderVersionOne) is
+        // exactly 32 bytes: headerSize(4) + version(4) + vendorID(4) +
+        // deviceID(4) + pipelineCacheUUID(16).
+        constexpr size_t kHeaderSize = 32;
+        if (size >= kHeaderSize) {
+            f.seekg(0);
+            cacheData.resize(size);
+            f.read(reinterpret_cast<char*>(cacheData.data()),
+                   static_cast<std::streamsize>(size));
+
+            VkPhysicalDeviceProperties props{};
+            vkGetPhysicalDeviceProperties(m_ctx.physicalDevice(), &props);
+
+            // Read the relevant fields from the on-disk header.
+            uint32_t diskVendor = 0, diskDevice = 0;
+            std::memcpy(&diskVendor, cacheData.data() + 8,  4);
+            std::memcpy(&diskDevice, cacheData.data() + 12, 4);
+            const uint8_t* diskUUID = cacheData.data() + 16;
+
+            const bool uuidMatch =
+                diskVendor == props.vendorID &&
+                diskDevice == props.deviceID &&
+                std::memcmp(diskUUID, props.pipelineCacheUUID, VK_UUID_SIZE) == 0;
+
+            if (uuidMatch) {
+                cacheInfo.initialDataSize = cacheData.size();
+                cacheInfo.pInitialData    = cacheData.data();
+                std::printf("[App] Pipeline cache loaded (%zu bytes)\n", size);
+            } else {
+                cacheData.clear();
+                std::printf("[App] Pipeline cache skipped (GPU mismatch -- will rebuild)\n");
+            }
+        }
     }
 
     if (vkCreatePipelineCache(m_ctx.device(), &cacheInfo, nullptr, &m_pipelineCache) != VK_SUCCESS)
