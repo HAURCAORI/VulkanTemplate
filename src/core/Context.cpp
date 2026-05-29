@@ -72,7 +72,19 @@ void Context::init(GLFWwindow* window, const CreateInfo& info) {
     m_physDevice = physResult.value();
 
     // -- 5. Logical device -----------------------------------------------------
+    // Query descriptor indexing features (Vulkan 1.2 core; required for bindless textures).
+    // Forward the hardware-reported struct directly: only VK_TRUE fields get enabled.
+    VkPhysicalDeviceDescriptorIndexingFeatures indexingFeatures{};
+    indexingFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
+    {
+        VkPhysicalDeviceFeatures2 f2{};
+        f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        f2.pNext = &indexingFeatures;
+        vkGetPhysicalDeviceFeatures2(m_physDevice.physical_device, &f2);
+    }
+
     vkb::DeviceBuilder deviceBuilder{m_physDevice};
+    deviceBuilder.add_pNext(&indexingFeatures);
     auto devResult = deviceBuilder.build();
 
     if (!devResult)

@@ -62,7 +62,6 @@ FetchContent_MakeAvailable(glm)
 # STB_IMAGE_IMPLEMENTATION must be defined in exactly one .cpp (Texture.cpp).
 FetchContent_Declare(stb
     GIT_REPOSITORY https://github.com/nothings/stb.git
-    GIT_TAG        2fb8c5a3deb2110c89669f8d6f36e5833b556b44
     GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(stb)

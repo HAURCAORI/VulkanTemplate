@@ -258,10 +258,11 @@ void Application::createBindlessResources() {
     vkGetPhysicalDeviceFeatures2(m_ctx.physicalDevice(), &feat2);
 
     m_bindlessSupported =
-        indexing.descriptorBindingPartiallyBound       &&
-        indexing.runtimeDescriptorArray                &&
-        indexing.shaderSampledImageArrayNonUniformIndexing &&
-        indexing.descriptorBindingVariableDescriptorCount;
+        indexing.descriptorBindingPartiallyBound               &&
+        indexing.runtimeDescriptorArray                        &&
+        indexing.shaderSampledImageArrayNonUniformIndexing     &&
+        indexing.descriptorBindingVariableDescriptorCount      &&
+        indexing.descriptorBindingSampledImageUpdateAfterBind;
 
     std::printf("[App] Bindless textures: %s\n",
                 m_bindlessSupported ? "supported" : "not supported (per-bind fallback)");
